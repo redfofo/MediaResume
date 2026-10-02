@@ -1,0 +1,21 @@
+plex:
+  url: http://192.168.1.10:32400
+  token: your-plex-token          # 服务器所有者的 X-Plex-Token
+
+emby:
+  url: http://192.168.1.11:8096
+  api_key: your-emby-api-key      # Emby 后台 -> 高级 -> API 密钥
+
+mappings:
+  # plex_user 留空表示 Plex 服务器所有者（你自己）
+  - plex_user:
+    emby_user: your-emby-username # Emby 用户名或用户 Id
+
+sync:
+  reconcile_interval: 900         # 定时对账间隔（秒）
+  progress_interval: 60           # 播放中推送进度的最小间隔（秒）
+  echo_window: 10                 # 写入后忽略回传事件的时间窗口（秒）
+  dry_run: true                   # 首次运行建议开启，确认日志无误后改为 false（也可在 Web 页面中配置）
+
+db_path: data/state.db
+log_level: INFO

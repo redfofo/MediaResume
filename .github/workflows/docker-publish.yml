@@ -1,0 +1,33 @@
+# Repository secret: DOCKERHUB_TOKEN (a Docker Hub access token with write permission)
+# Pushing vX.Y.Z publishes redfofo/mediaresume:X.Y.Z and :latest.
+
+name: Publish Docker image
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Build and publish
+    uses: docker/github-builder/.github/workflows/build.yml@v1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      output: image
+      push: true
+      platforms: linux/amd64,linux/arm64
+      meta-images: redfofo/mediaresume
+      meta-tags: |
+        type=raw,value=latest
+        type=semver,pattern={{version}}
+    secrets:
+      registry-auths: |
+        - registry: docker.io
+          username: redfofo
+          password: ${{ secrets.DOCKERHUB_TOKEN }}

@@ -1,0 +1,11 @@
+services:
+  mediaresume:
+    build: .
+    container_name: mediaresume
+    restart: unless-stopped
+    ports:
+      - "8095:8095"
+    environment:
+      MEDIARESUME_PASSWORD: ${MEDIARESUME_PASSWORD:-}
+    volumes:
+      - ./config:/app/config

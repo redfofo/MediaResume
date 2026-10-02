@@ -1,0 +1,58 @@
+# Local configuration, credentials, and runtime data
+config.yaml
+config/
+data/
+.env
+.env.*
+!.env.example
+!.env.sample
+secrets/
+credentials/
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# Databases, logs, and local overrides
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+logs/
+docker-compose.override.yml
+docker-compose.local.yml
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Frontend
+web/node_modules/
+web/dist/
+web/.vite/
+
+# Editors and operating systems
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Temporary and backup files
+*.tmp
+*.temp
+*.bak
