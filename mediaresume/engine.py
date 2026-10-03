@@ -5,13 +5,14 @@ import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
-from typing import Optional
+from typing import Any, Optional
 
 from .config import Config, Mapping
 from .emby import EmbyClient
 from .models import POSITION_TOLERANCE_MS, MediaItem, MediaKey, WatchState, merge_states
 from .plex import PlexClient
 from .store import StateStore
+from .trakt import PROGRESS_MIN, PROGRESS_MAX, PROGRESS_STEP, PushPlan, TraktSync, percent_of
 
 log = logging.getLogger("engine")
 
@@ -58,6 +59,8 @@ class Pair:
     # 上一轮的继续观看列表：分组(movie:tmdb:X / show:tmdb:X) -> 条目 id
     plex_resume: Optional[dict[str, list[str]]] = None
     emby_resume: Optional[dict[str, list[str]]] = None
+    # 最近一次得到的统一状态：MediaKey -> (状态, 标题, 片长)，供 Trakt 全量同步生成计划
+    unified: dict[MediaKey, tuple[WatchState, str, int]] = field(default_factory=dict)
 
     @property
     def id(self) -> str:
@@ -70,11 +73,16 @@ class Pair:
 
 
 class SyncEngine:
-    def __init__(self, cfg: Config, plex: PlexClient, emby: EmbyClient, store: StateStore):
+    def __init__(
+        self, cfg: Config, plex: PlexClient, emby: EmbyClient, store: StateStore, trakt: Optional[TraktSync] = None
+    ):
         self.cfg = cfg
         self.plex = plex
         self.emby = emby
         self.store = store
+        # 未绑定 Trakt 账户时为 None
+        self.trakt = trakt
+        self._background: set[asyncio.Task] = set()
         self.pairs: list[Pair] = []
         # 所有同步操作在单个 worker 中串行执行，避免竞态
         self.queue: asyncio.Queue[tuple] = asyncio.Queue()
@@ -96,6 +104,9 @@ class SyncEngine:
             pair = Pair(m, m.plex_token or self.cfg.plex.token, user["id"], user["name"])
             self.pairs.append(pair)
             log.info("用户映射: Plex[%s] <-> Emby[%s] (%s)", m.plex_user or "所有者", user["name"], user["id"])
+            if self.trakt and m.trakt_user:
+                self.trakt.add_account(m.trakt_user)
+                log.info("用户映射: Plex[%s] / Emby[%s] -> Trakt[%s]", m.plex_user or "所有者", user["name"], m.trakt_user)
 
     async def run(self) -> None:
         await self.setup()
@@ -103,12 +114,15 @@ class SyncEngine:
         for pair in self.pairs:
             pair.plex_since = pair.emby_since = now
         self.queue.put_nowait(("reconcile",))
-        await asyncio.gather(
-            self._worker(),
-            self._reconcile_timer(),
-            self._poll_loop(),
-            self.plex.listen(self.on_plex_playing),
-        )
+        tasks = [self._worker(), self._reconcile_timer(), self._poll_loop(), self.plex.listen(self.on_plex_playing)]
+        if self.trakt and self.trakt.accounts:
+            tasks.append(self.trakt.run())
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            # 引擎重启时一并停止进行中的 Trakt 全量推送
+            for task in self._background:
+                task.cancel()
 
     # ---------- 事件入口 ----------
 
@@ -374,6 +388,8 @@ class SyncEngine:
                     except Exception as e:
                         fut.set_exception(e)
                         raise
+                elif job[0] == "trakt_pull":
+                    await self._trakt_pull(*job[1:])
                 else:
                     await self._handle_event(*job)
             except Exception:
@@ -406,9 +422,13 @@ class SyncEngine:
         if src == "plex" and self._plex_playing_unstable(item_id, src_item.state):
             log.debug("[%s] %s 正在播放且进度接近 0，可能是续播前的瞬时状态，忽略", pair.id, src_item.title)
             return
+        playing = src == "plex" and item_id in self._plex_playing
         # 一个文件包含多集时，对每一集分别同步
         for key in (src_item.key, *src_item.alt_keys):
             await self._sync_key(src, pair, replace(src_item, key=key, alt_keys=()))
+            # Plex 正在播放时，Emby 侧的变化是我们同步过去的，不能当成“暂停”推给 Trakt
+            live = src == "plex" or not any(i in self._plex_playing for i in pair.plex_index.get(key, []))
+            self._observe(pair, key, src_item.state, src_item.title, src_item.duration_ms, playing, live)
 
     async def _sync_key(self, src: str, pair: Pair, src_item: MediaItem) -> None:
         dst = "emby" if src == "plex" else "plex"
@@ -452,11 +472,16 @@ class SyncEngine:
         plex_groups = await self._index("plex", pair)
         emby_groups = await self._index("emby", pair)
         changed = 0
+        # 只在一端存在的条目不参与双向同步，但它们的状态同样是用户的观看记录
+        for key in plex_groups.keys() ^ emby_groups.keys():
+            items = plex_groups.get(key) or emby_groups[key]
+            self._observe(pair, key, merge_states(items), items[0].title, _duration(items))
         for key in plex_groups.keys() & emby_groups.keys():
             p_items, e_items = plex_groups[key], emby_groups[key]
             p, e = merge_states(p_items), merge_states(e_items)
             base = self.store.get(pair.id, key)
             target = decide(p, e, base)
+            self._observe(pair, key, target or p, p_items[0].title, _duration(p_items + e_items))
             if target is None:
                 if not p.same_as(base):
                     self.store.set(pair.id, key, p)
@@ -484,6 +509,157 @@ class SyncEngine:
             "[%s] 对账完成：Plex %d 项，Emby %d 项，匹配 %d 项，同步 %d 项，用时 %.1fs",
             pair.id, stats["plex"], stats["emby"], stats["matched"], changed, stats["seconds"],
         )
+
+    def _observe(
+        self,
+        pair: Pair,
+        key: MediaKey,
+        state: WatchState,
+        title: str = "",
+        duration_ms: int = 0,
+        playing: bool = False,
+        live: bool = False,
+    ) -> None:
+        """记录统一状态供 Trakt 全量同步使用；实时事件中的状态推送到 Trakt"""
+        if not self.trakt or not pair.mapping.trakt_user:
+            return
+        pair.unified[key] = (state, title, duration_ms)
+        if live:
+            self.trakt.observe_live(pair.mapping.trakt_user, key, state, duration_ms, title, playing)
+
+    # ---------- Trakt 全量同步（手动） ----------
+
+    async def _items_for(self, pair: Pair, key: MediaKey) -> tuple[list[MediaItem], list[MediaItem]]:
+        """两端对应条目；只查对账建立的索引，不做定向查找（条目可能很多）"""
+        out = []
+        for server in ("plex", "emby"):
+            index = pair.plex_index if server == "plex" else pair.emby_index
+            out.append([i for i in [await self._get_item(server, pair, d) for d in index.get(key, [])] if i])
+        return out[0], out[1]
+
+    async def trakt_plan(self, pair: Pair, direction: str) -> tuple[dict, Any]:
+        """基于最近一次对账的统一状态与 Trakt 当前数据生成同步计划，返回 (页面展示用, 执行用)。
+        to_trakt：本地已看而 Trakt 没有的补观看记录；本地进度写入 Trakt；本地已看完的清除 Trakt 进度。
+        from_trakt：Trakt 已看而本地未看的标记已看；Trakt 进度更新且差距明显的写入本地。都不会改为未看。"""
+        user = pair.mapping.trakt_user
+        if not self.trakt or not user:
+            raise ValueError("该映射未绑定 Trakt 账户")
+        if not pair.unified:
+            raise ValueError("请等待首次对账完成")
+        watched = await self.trakt.client.watched(user)
+        playback = await self.trakt.client.playback(user)
+
+        def entry(key: MediaKey, **extra) -> dict:
+            return {"key": str(key), "title": pair.unified[key][1] or str(key), **extra}
+
+        if direction == "to_trakt":
+            plan = PushPlan()
+            for key, (state, _, duration) in pair.unified.items():
+                pb = playback.get(key)
+                if state.played:
+                    if key not in watched:
+                        plan.history[key] = state.last_played
+                    if pb:
+                        plan.clear[key] = pb.id
+                    continue
+                pct = percent_of(state, duration)
+                if PROGRESS_MIN <= pct < PROGRESS_MAX and (pb is None or abs(pb.progress - pct) >= 2 * PROGRESS_STEP):
+                    plan.progress[key] = pct
+            show = {
+                "history": [entry(k, watched_at=ts) for k, ts in plan.history.items()],
+                "progress": [
+                    entry(k, local_pct=pct, trakt_pct=playback[k].progress if k in playback else None)
+                    for k, pct in plan.progress.items()
+                ],
+                "clear": [entry(k, trakt_pct=playback[k].progress) for k in plan.clear],
+            }
+        elif direction == "from_trakt":
+            pull_watched = {
+                k: ts for k, ts in watched.items() if k in pair.unified and not pair.unified[k][0].played
+            }
+            pull_progress: dict[MediaKey, tuple[float, int]] = {}
+            skipped = 0
+            for key, pb in playback.items():
+                if key not in pair.unified or key in pull_watched:
+                    continue
+                state, _, duration = pair.unified[key]
+                if state.played or duration <= 0 or not _progress_differs(state, duration, pb.progress):
+                    continue
+                if pb.paused_at <= state.last_played:
+                    skipped += 1  # 本地更新
+                    continue
+                pull_progress[key] = (pb.progress, pb.paused_at)
+            plan = (pull_watched, pull_progress)
+            show = {
+                "watched": [entry(k, watched_at=ts) for k, ts in pull_watched.items()],
+                "progress": [
+                    entry(k, local_pct=percent_of(pair.unified[k][0], pair.unified[k][2]), trakt_pct=pct)
+                    for k, (pct, _) in pull_progress.items()
+                ],
+                "skipped_newer": skipped,
+            }
+        else:
+            raise ValueError(f"未知的同步方向: {direction}")
+        for items in show.values():
+            if isinstance(items, list):
+                items.sort(key=lambda i: i["title"])
+        return {"direction": direction, "trakt_user": user, **show}, plan
+
+    async def trakt_execute(self, pair: Pair, direction: str) -> dict:
+        """推送在后台任务中执行（只写 Trakt，不占用 worker）；拉回交给 worker 串行写入 Plex / Emby"""
+        user = pair.mapping.trakt_user
+        if self.trakt and user and self.trakt.accounts[user].busy:
+            raise ValueError(f"Trakt[{user}] 已有全量同步在执行")
+        show, plan = await self.trakt_plan(pair, direction)
+        if direction == "to_trakt":
+            task = asyncio.create_task(self.trakt.push_full(user, plan))
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
+        else:
+            self.queue.put_nowait(("trakt_pull", pair, *plan))
+        return {k: len(v) if isinstance(v, list) else v for k, v in show.items()}
+
+    async def _trakt_pull(
+        self, pair: Pair, watched: dict[MediaKey, int], progress: dict[MediaKey, tuple[float, int]]
+    ) -> None:
+        log.info(
+            "[%s] 从 Trakt[%s] 全量同步开始：标记已看 %d 条，写入进度 %d 条%s",
+            pair.id, pair.mapping.trakt_user, len(watched), len(progress), "（dry-run）" if self.cfg.sync.dry_run else "",
+        )
+        n_watched = n_progress = 0
+        for key, watched_at in watched.items():
+            p_items, e_items = await self._items_for(pair, key)
+            if all(i.state.played for i in p_items + e_items):
+                continue  # 包括两端都没有
+            target = WatchState(True, 0, watched_at)
+            log.info("[%s] trakt → plex/emby: %s %s", pair.id, (p_items + e_items)[0].title or key, _fmt(target))
+            await self._apply("plex", pair, p_items, target)
+            await self._apply("emby", pair, e_items, target)
+            if not self.cfg.sync.dry_run:
+                self.store.set(pair.id, key, target)
+            n_watched += 1
+        acc = self.trakt.accounts.get(pair.mapping.trakt_user)
+        for key, (pct, paused_at) in progress.items():
+            # 执行时重新读取，跳过计划生成后本地又有变化的条目
+            p_items, e_items = await self._items_for(pair, key)
+            items = p_items + e_items
+            duration = _duration(items)
+            if not items or duration <= 0:
+                continue
+            cur = merge_states(items)
+            if cur.played or paused_at <= cur.last_played or not _progress_differs(cur, duration, pct):
+                continue
+            target = WatchState(False, int(duration * pct / 100), paused_at)
+            log.info("[%s] trakt → plex/emby: %s %s", pair.id, items[0].title or key, _fmt(target))
+            await self._apply("plex", pair, p_items, target)
+            await self._apply("emby", pair, e_items, target)
+            if not self.cfg.sync.dry_run:
+                self.store.set(pair.id, key, target)
+            if acc:
+                # 写入后两端的回传事件不应再把同样的进度推回 Trakt
+                acc.progress_sent[key] = (pct, False)
+            n_progress += 1
+        log.info("[%s] 从 Trakt 全量同步完成：标记已看 %d 条，写入进度 %d 条", pair.id, n_watched, n_progress)
 
     # ---------- 服务器操作封装 ----------
 
@@ -571,6 +747,15 @@ class SyncEngine:
         now = time.monotonic()
         for k in [k for k, v in self._echo.items() if v <= now]:
             del self._echo[k]
+
+
+def _progress_differs(state: WatchState, duration_ms: int, pct: float) -> bool:
+    """本地进度与 Trakt 百分比的差距超过容差（Trakt 只有百分比，至少按 2% 片长计）"""
+    return abs(int(duration_ms * pct / 100) - state.position_ms) >= max(POSITION_TOLERANCE_MS, duration_ms // 50)
+
+
+def _duration(items: list[MediaItem]) -> int:
+    return max((i.duration_ms for i in items), default=0)
 
 
 def _fmt(s: WatchState) -> str:

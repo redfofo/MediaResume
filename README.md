@@ -10,6 +10,7 @@ MediaResume 用于在 Plex 和 Emby 之间双向同步播放记录。
 - 双向同步“已看 / 未看”状态
 - 检测并同步从“继续观看”中移除的条目
 - 手动预览并同步两端的“继续观看”列表
+- 可选：实时推送播放进度到 Trakt，手动与 Trakt 全量同步已看记录和进度
 - 支持多个 Plex 用户与 Emby 用户映射
 - Plex 播放事件通过 WebSocket 接收，其他变化通过增量轮询发现
 - 定时全量对账，修复服务离线期间遗漏的变化
@@ -162,7 +163,8 @@ MEDIARESUME_PASSWORD=请替换为一个强密码
 ```text
 config.yaml
 data/
-└── state.db
+├── state.db
+└── trakt_tokens.json   # 授权 Trakt 后才会出现
 ```
 
 实际目录结构为：
@@ -217,6 +219,55 @@ MediaResume 会同步：
 3. 确认后执行一次性同步。
 
 限制：Plex 没有可用于手动加入“下一集推荐”的对应接口。遇到这种条目时，预览页面会将其标记为不支持，而不会伪造同步结果。
+
+## Trakt 同步（可选）
+
+MediaResume 以 Plex / Emby 合并后的状态为准与 Trakt 同步，不需要 Trakt VIP。
+
+### 配置步骤
+
+1. 登录 Trakt，打开 [新建 App](https://trakt.tv/oauth/applications/new)：
+   - Name 任意填写，例如 `MediaResume`；
+   - Redirect URI 填写 `urn:ietf:wg:oauth:2.0:oob`；
+   - 其余选项保持默认，保存后得到 Client ID 和 Client Secret。
+2. 在 MediaResume 的“配置”页填写 Trakt Client ID 和 Client Secret。
+3. 点击“授权 Trakt 账户”，按提示打开 Trakt 网页并输入授权码。多个家庭成员可以分别授权各自的 Trakt 账户。
+4. 在“用户映射”中为需要同步的映射选择 Trakt 账户。
+5. 点击“保存并重启同步”，在“运行状态”页的 Trakt 卡片和日志中查看结果。
+6. 首次对账完成后，按需在 Trakt 卡片中执行一次全量同步，补齐历史记录。
+
+### 自动：实时推送播放进度
+
+默认开启，可在配置页关闭。只处理实时发生的播放，不会自动推送或拉取历史记录。
+
+- Plex 播放时，Trakt 显示“正在观看”；暂停或停止时保存进度。
+- 本次运行中推送过进度的条目播放完成后，Trakt 记录一次观看。
+- 在 Plex / Emby 中直接标记已看，不会自动同步到 Trakt，需要执行全量同步。
+- Emby 没有可用的实时播放事件，Emby 上的播放只推送暂停进度，不显示“正在观看”。
+
+### 手动：全量同步
+
+在“运行状态”页的 Trakt 卡片中执行。两个方向都先预览，确认后在后台执行，进度和结果在日志中查看。全量同步基于最近一次对账的结果。
+
+| 按钮 | 已看记录 | 播放进度 |
+| --- | --- | --- |
+| 全量同步到 Trakt | 本地已看而 Trakt 上没有的，添加观看记录，时间取最后播放时间 | 本地看到一半的写入 Trakt；本地已看完的清除 Trakt 上残留的进度 |
+| 从 Trakt 全量同步 | Trakt 已看而本地未看的，在 Plex / Emby 中标记为已看 | Trakt 的进度比本地新且相差明显时，写入 Plex / Emby |
+
+两个方向都只做补充：不会删除 Trakt 上的观看记录，也不会把 Plex / Emby 的条目改为未看。
+
+### 限制
+
+- 只向 Trakt 推送 1%～79% 的进度；Trakt 会把 80% 以上的停止记为看完，而本地此时还没看完。
+- Trakt 的进度只有百分比，写入 Plex / Emby 的位置有一定误差；本地进度与 Trakt 相差不到 2% 片长时视为一致。
+- 一个文件包含多集时（如 `S01E01-E02`），无法换算单集进度，不同步进度。
+- Trakt 只保留最近 6 个月的播放进度。
+- 重看不会追加 Trakt 播放次数（实时播放看完除外）。
+- Dry-run 模式下只在日志中列出将要执行的操作。
+- Trakt 的 access token 有效期为 24 小时，MediaResume 会自动续期。授权失效时，状态页会提示重新授权。
+- 授权信息保存在挂载目录的 `data/trakt_tokens.json` 中，请和 `config.yaml` 一样妥善保管。
+
+如果同时使用 Emby 的 Trakt 插件或 PlexTraktSync，它们会各自写入 Trakt。建议只保留一种方式，避免同一次观看被记录多次。
 
 ## 常用设置
 

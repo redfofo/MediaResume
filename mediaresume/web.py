@@ -13,11 +13,12 @@ from typing import Optional
 import aiohttp
 from aiohttp import web
 
-from .config import Config, config_to_dict, load_config, parse_config, save_config
+from .config import Config, TraktConfig, config_to_dict, load_config, parse_config, save_config
 from .emby import EmbyClient
 from .engine import SyncEngine
 from .plex import PlexClient
 from .store import StateStore
+from .trakt import TraktClient, TraktSync, TraktTokenStore, token_record
 
 log = logging.getLogger("web")
 
@@ -59,6 +60,8 @@ class Runner:
         self.task: Optional[asyncio.Task] = None
         self.error: Optional[str] = None
         self.started_at: Optional[float] = None
+        # 与配置文件放在同一挂载目录下
+        self.trakt_tokens = TraktTokenStore(config_path.parent / "data" / "trakt_tokens.json")
 
     async def start(self) -> None:
         self.error = None
@@ -73,11 +76,16 @@ class Runner:
             return
         logging.getLogger().setLevel(self.cfg.log_level.upper())
         self.store = StateStore(self.cfg.db_path)
+        trakt = None
+        if any(m.trakt_user for m in self.cfg.mappings):
+            client = TraktClient(self.http, self.cfg.trakt, self.trakt_tokens)
+            trakt = TraktSync(client, self.cfg.trakt, self.cfg.sync.dry_run)
         self.engine = SyncEngine(
             self.cfg,
             PlexClient(self.http, self.cfg.plex.url, self.cfg.plex.token),
             EmbyClient(self.http, self.cfg.emby.url, self.cfg.emby.api_key),
             self.store,
+            trakt,
         )
         self.started_at = time.time()
         self.task = asyncio.create_task(self.engine.run())
@@ -126,10 +134,12 @@ class Runner:
                     "id": p.id,
                     "plex_user": p.mapping.plex_user,
                     "emby_user": p.emby_user_name or p.mapping.emby_user,
+                    "trakt_user": p.mapping.trakt_user,
                     "reconcile": eng.reconcile_stats.get(p.id),
                 }
                 for p in (eng.pairs if running and eng else [])
             ],
+            "trakt": eng.trakt.status() if running and eng and eng.trakt else [],
         }
 
 
@@ -198,6 +208,89 @@ def create_app(runner: Runner, logs: LogBuffer, dist: Path) -> web.Application:
             except Exception as e:
                 return web.json_response({"ok": False, "error": _err(e)})
         return web.json_response({"ok": True, **info, "users": users})
+
+    # ---------- Trakt 设备码授权 ----------
+    # 页面上的 Client ID / Secret 可能尚未保存，因此由请求携带
+
+    def _trakt_client(body: dict) -> TraktClient:
+        cfg = TraktConfig(str(body.get("client_id") or "").strip(), str(body.get("client_secret") or "").strip())
+        if not (cfg.client_id and cfg.client_secret):
+            raise web.HTTPBadRequest(text='{"error": "请先填写 Trakt Client ID 和 Client Secret"}', content_type="application/json")
+        return TraktClient(runner.http, cfg, runner.trakt_tokens)
+
+    @routes.get("/api/trakt/accounts")
+    async def trakt_accounts(_: web.Request) -> web.Response:
+        return web.json_response({"accounts": runner.trakt_tokens.users()})
+
+    @routes.post("/api/trakt/device-code")
+    async def trakt_device_code(request: web.Request) -> web.Response:
+        client = _trakt_client(await request.json())
+        try:
+            data = await client.device_code()
+        except Exception as e:
+            return web.json_response({"ok": False, "error": _err(e)})
+        return web.json_response({"ok": True, **data})
+
+    @routes.post("/api/trakt/device-token")
+    async def trakt_device_token(request: web.Request) -> web.Response:
+        body = await request.json()
+        client = _trakt_client(body)
+        try:
+            status, data = await client.device_token(str(body.get("device_code") or ""))
+            if status == 200:
+                username = await client.username_of(data["access_token"])
+                runner.trakt_tokens.set(username, token_record(data, client.cfg.client_id))
+                log.info("Trakt 账户 %s 授权成功", username)
+                return web.json_response({"status": "ok", "username": username})
+        except Exception as e:
+            return web.json_response({"status": "error", "error": _err(e)})
+        result = {400: "pending", 429: "slow_down", 404: "invalid", 409: "used", 410: "expired", 418: "denied"}
+        return web.json_response({"status": result.get(status, "error"), "error": f"HTTP {status}"})
+
+    def _running_engine():
+        if not runner.engine or not runner.task or runner.task.done():
+            raise web.HTTPConflict(text='{"error": "同步引擎未运行"}', content_type="application/json")
+        return runner.engine
+
+    def _trakt_direction(body: dict) -> str:
+        direction = body.get("direction")
+        if direction not in ("to_trakt", "from_trakt"):
+            raise web.HTTPBadRequest(text='{"error": "direction 必须是 to_trakt 或 from_trakt"}', content_type="application/json")
+        return direction
+
+    @routes.post("/api/trakt/sync/preview")
+    async def trakt_sync_preview(request: web.Request) -> web.Response:
+        direction = _trakt_direction(await request.json())
+        eng = _running_engine()
+        pairs = []
+        for p in eng.pairs:
+            if not p.mapping.trakt_user:
+                continue
+            try:
+                pairs.append({**_pair_info(p), "plan": (await eng.trakt_plan(p, direction))[0]})
+            except Exception as e:
+                pairs.append({**_pair_info(p), "error": _err(e)})
+        return web.json_response({"pairs": pairs, "dry_run": eng.cfg.sync.dry_run})
+
+    @routes.post("/api/trakt/sync/execute")
+    async def trakt_sync_execute(request: web.Request) -> web.Response:
+        # 条目可能很多，计划生成后在后台执行，进度和结果看日志
+        direction = _trakt_direction(await request.json())
+        eng = _running_engine()
+        pairs = []
+        for p in eng.pairs:
+            if not p.mapping.trakt_user:
+                continue
+            try:
+                pairs.append({**_pair_info(p), "counts": await eng.trakt_execute(p, direction)})
+            except Exception as e:
+                pairs.append({**_pair_info(p), "error": _err(e)})
+        return web.json_response({"pairs": pairs})
+
+    @routes.delete("/api/trakt/accounts/{username}")
+    async def trakt_delete_account(request: web.Request) -> web.Response:
+        runner.trakt_tokens.delete(request.match_info["username"])
+        return web.json_response({"ok": True})
 
     @routes.get("/api/status")
     async def status(_: web.Request) -> web.Response:

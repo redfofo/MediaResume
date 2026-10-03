@@ -21,6 +21,15 @@ class EmbyConfig:
 
 
 @dataclass
+class TraktConfig:
+    # 用户自建 Trakt App 的凭据，Redirect URI 填 urn:ietf:wg:oauth:2.0:oob
+    client_id: str = ""
+    client_secret: str = ""
+    # 实时播放进度推送到 Trakt（正在观看 / 暂停进度 / 看完）；全量同步由页面手动触发
+    scrobble: bool = True
+
+
+@dataclass
 class Mapping:
     # Plex 用户名（为空表示服务器所有者 / 接受所有会话）
     plex_user: Optional[str]
@@ -28,6 +37,8 @@ class Mapping:
     emby_user: str
     # 该 Plex 用户的 token，为空时使用 plex.token（所有者）
     plex_token: Optional[str] = None
+    # 已授权的 Trakt 用户名，为空表示该映射不推送到 Trakt
+    trakt_user: Optional[str] = None
 
 
 @dataclass
@@ -51,6 +62,7 @@ class Config:
     emby: EmbyConfig
     mappings: list[Mapping]
     sync: SyncConfig = field(default_factory=SyncConfig)
+    trakt: TraktConfig = field(default_factory=TraktConfig)
     db_path: str = "data/state.db"
     log_level: str = "INFO"
 
@@ -71,6 +83,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
             plex_user=m.get("plex_user") or None,
             emby_user=str(m.get("emby_user") or "").strip(),
             plex_token=m.get("plex_token") or None,
+            trakt_user=str(m.get("trakt_user") or "").strip() or None,
         )
         for m in raw.get("mappings") or []
     ]
@@ -78,6 +91,13 @@ def parse_config(raw: dict[str, Any]) -> Config:
         raise ValueError("至少需要一个用户映射")
     if any(not m.emby_user for m in mappings):
         raise ValueError("用户映射中的 Emby 用户不能为空")
+    trakt_raw = raw.get("trakt") or {}
+    trakt = TraktConfig(
+        **{k: v for k, v in trakt_raw.items() if k in TraktConfig.__dataclass_fields__ and v is not None},
+    )
+    trakt.client_id, trakt.client_secret = str(trakt.client_id).strip(), str(trakt.client_secret).strip()
+    if any(m.trakt_user for m in mappings) and not (trakt.client_id and trakt.client_secret):
+        raise ValueError("用户映射绑定了 Trakt 账户，需要填写 Trakt Client ID 和 Client Secret")
     sync_raw = raw.get("sync") or {}
     sync = SyncConfig(**{k: v for k, v in sync_raw.items() if k in SyncConfig.__dataclass_fields__})
     return Config(
@@ -85,6 +105,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
         emby=emby,
         mappings=mappings,
         sync=sync,
+        trakt=trakt,
         db_path=raw.get("db_path", "data/state.db"),
         log_level=raw.get("log_level", "INFO"),
     )

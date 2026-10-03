@@ -2,11 +2,17 @@ export interface Mapping {
   plex_user: string | null
   emby_user: string
   plex_token: string | null
+  trakt_user: string | null
 }
 
 export interface Config {
   plex: { url: string; token: string }
   emby: { url: string; api_key: string }
+  trakt: {
+    client_id: string
+    client_secret: string
+    scrobble: boolean
+  }
   mappings: Mapping[]
   sync: {
     reconcile_interval: number
@@ -41,7 +47,62 @@ export interface Status {
   poll_error: string | null
   reconciling: boolean
   queue: number
-  pairs: { id: string; plex_user: string | null; emby_user: string; reconcile: ReconcileStats | null }[]
+  pairs: {
+    id: string
+    plex_user: string | null
+    emby_user: string
+    trakt_user: string | null
+    reconcile: ReconcileStats | null
+  }[]
+  trakt: TraktStatus[]
+}
+
+export interface TraktStatus {
+  user: string
+  pending: number
+  progress_pushed: number
+  last_push: number | null
+  busy: boolean
+  error: string | null
+}
+
+export type TraktDirection = 'to_trakt' | 'from_trakt'
+
+export interface TraktPlanEntry {
+  key: string
+  title: string
+  watched_at?: number
+  local_pct?: number
+  trakt_pct?: number | null
+}
+
+export interface TraktPlan {
+  direction: TraktDirection
+  trakt_user: string
+  // to_trakt
+  history?: TraktPlanEntry[]
+  clear?: TraktPlanEntry[]
+  // from_trakt
+  watched?: TraktPlanEntry[]
+  skipped_newer?: number
+  // 两个方向都有
+  progress: TraktPlanEntry[]
+}
+
+export interface TraktDeviceCode {
+  ok: boolean
+  error?: string
+  device_code?: string
+  user_code?: string
+  verification_url?: string
+  expires_in?: number
+  interval?: number
+}
+
+export interface TraktDeviceToken {
+  status: 'ok' | 'pending' | 'slow_down' | 'invalid' | 'used' | 'expired' | 'denied' | 'error'
+  username?: string
+  error?: string
 }
 
 export interface LogRecord {
@@ -129,6 +190,21 @@ export const api = {
     }),
   resumeExecute: (direction: ResumeDirection) =>
     request<{ pairs: (ResumePairBase & { result?: ResumeResult })[] }>('POST', '/api/resume-sync/execute', { direction }),
+  traktAccounts: () => request<{ accounts: string[] }>('GET', '/api/trakt/accounts'),
+  traktDeviceCode: (client_id: string, client_secret: string) =>
+    request<TraktDeviceCode>('POST', '/api/trakt/device-code', { client_id, client_secret }),
+  traktDeviceToken: (client_id: string, client_secret: string, device_code: string) =>
+    request<TraktDeviceToken>('POST', '/api/trakt/device-token', { client_id, client_secret, device_code }),
+  traktSyncPreview: (direction: TraktDirection) =>
+    request<{ pairs: (ResumePairBase & { plan?: TraktPlan })[]; dry_run: boolean }>('POST', '/api/trakt/sync/preview', {
+      direction,
+    }),
+  traktSyncExecute: (direction: TraktDirection) =>
+    request<{ pairs: (ResumePairBase & { counts?: Record<string, number> })[] }>('POST', '/api/trakt/sync/execute', {
+      direction,
+    }),
+  traktDeleteAccount: (username: string) =>
+    request<{ ok: boolean }>('DELETE', `/api/trakt/accounts/${encodeURIComponent(username)}`),
   logs: (after: number) => request<{ seq: number; logs: LogRecord[] }>('GET', `/api/logs?after=${after}`),
 }
 
@@ -136,7 +212,8 @@ export function defaultConfig(): Config {
   return {
     plex: { url: 'http://127.0.0.1:32400', token: '' },
     emby: { url: 'http://127.0.0.1:8096', api_key: '' },
-    mappings: [{ plex_user: null, emby_user: '', plex_token: null }],
+    trakt: { client_id: '', client_secret: '', scrobble: true },
+    mappings: [{ plex_user: null, emby_user: '', plex_token: null, trakt_user: null }],
     sync: { reconcile_interval: 900, poll_interval: 30, unwatch_poll_interval: 120, progress_interval: 60, echo_window: 10, dry_run: true },
     db_path: 'data/state.db',
     log_level: 'INFO',

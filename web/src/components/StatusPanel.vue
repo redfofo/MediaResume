@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { nextTick, onMounted, onUnmounted, ref } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Refresh, RefreshRight, Switch } from '@element-plus/icons-vue'
-import { api, type LogRecord, type Status } from '../api'
+import { Download, Refresh, RefreshRight, Switch, Upload } from '@element-plus/icons-vue'
+import { api, type LogRecord, type Status, type TraktDirection } from '../api'
 import ResumeSyncDialog from './ResumeSyncDialog.vue'
+import TraktSyncDialog from './TraktSyncDialog.vue'
 
 defineProps<{ status: Status | null }>()
 const emit = defineEmits<{ refresh: [] }>()
@@ -13,6 +14,13 @@ const autoScroll = ref(true)
 const logBox = ref<HTMLElement>()
 const busy = ref(false)
 const resumeDialog = ref(false)
+const traktDialog = ref(false)
+const traktDirection = ref<TraktDirection>('to_trakt')
+
+function openTrakt(direction: TraktDirection) {
+  traktDirection.value = direction
+  traktDialog.value = true
+}
 let lastSeq = 0
 let timer: number | undefined
 
@@ -121,6 +129,9 @@ onUnmounted(() => window.clearInterval(timer))
           <template #default="{ row }">{{ row.plex_user || '服务器所有者' }}</template>
         </el-table-column>
         <el-table-column prop="emby_user" label="Emby 用户" min-width="120" />
+        <el-table-column v-if="status.trakt.length" label="Trakt" min-width="100">
+          <template #default="{ row }">{{ row.trakt_user || '—' }}</template>
+        </el-table-column>
         <el-table-column label="最近对账" min-width="170">
           <template #default="{ row }">{{ row.reconcile ? fmtTime(row.reconcile.at) : '—' }}</template>
         </el-table-column>
@@ -131,6 +142,37 @@ onUnmounted(() => window.clearInterval(timer))
             <span v-else>
               Plex {{ row.reconcile.plex }} · Emby {{ row.reconcile.emby }} · 匹配 {{ row.reconcile.matched }} ·
               同步 {{ row.reconcile.changed }} · {{ row.reconcile.seconds }}s
+            </span>
+          </template>
+        </el-table-column>
+      </el-table>
+    </el-card>
+
+    <el-card v-if="status.trakt.length" shadow="never">
+      <template #header>
+        <div class="card-header">
+          <span>Trakt</span>
+          <div>
+            <el-button :icon="Upload" :disabled="!status.running" @click="openTrakt('to_trakt')">
+              全量同步到 Trakt
+            </el-button>
+            <el-button :icon="Download" :disabled="!status.running" @click="openTrakt('from_trakt')">
+              从 Trakt 全量同步
+            </el-button>
+          </div>
+        </div>
+      </template>
+      <el-table :data="status.trakt">
+        <el-table-column prop="user" label="账户" min-width="120" />
+        <el-table-column label="最近推送" min-width="170">
+          <template #default="{ row }">{{ row.last_push ? fmtTime(row.last_push) : '—' }}</template>
+        </el-table-column>
+        <el-table-column label="状态" min-width="280">
+          <template #default="{ row }">
+            <el-text v-if="row.error" type="danger">{{ row.error }}</el-text>
+            <span v-else>
+              <el-tag v-if="row.busy" type="warning" size="small">全量同步中</el-tag>
+              本次运行实时推送 {{ row.progress_pushed }} 次 · 待推送 {{ row.pending }}
             </span>
           </template>
         </el-table-column>
@@ -157,6 +199,7 @@ onUnmounted(() => window.clearInterval(timer))
   </div>
   <el-empty v-else description="无法连接后端" />
   <ResumeSyncDialog v-model="resumeDialog" />
+  <TraktSyncDialog v-model="traktDialog" :direction="traktDirection" />
 </template>
 
 <style scoped>

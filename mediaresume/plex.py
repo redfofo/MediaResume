@@ -114,7 +114,10 @@ class PlexClient:
             key = MediaKey("episode", tmdb, int(meta["parentIndex"]), int(meta["index"]))
         else:
             return None
-        return MediaItem("plex", str(meta["ratingKey"]), key, self._state_of(meta), meta.get("title", ""))
+        return MediaItem(
+            "plex", str(meta["ratingKey"]), key, self._state_of(meta), meta.get("title", ""),
+            duration_ms=int(meta.get("duration") or 0),
+        )
 
     async def get_item(self, rating_key: str, token: Optional[str] = None) -> Optional[MediaItem]:
         data = await self._get(f"/library/metadata/{rating_key}", {"includeGuids": 1}, token)

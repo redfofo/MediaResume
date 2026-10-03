@@ -108,7 +108,9 @@ class EmbyClient:
             alt_keys = tuple(MediaKey("episode", tmdb, season, n) for n in range(first + 1, last + 1))
         else:
             return None
-        return MediaItem("emby", str(item["Id"]), key, self._state_of(item), item.get("Name", ""), alt_keys)
+        # 一个文件包含多集时片长是整个文件的，无法换算单集进度
+        duration = 0 if alt_keys else int(item.get("RunTimeTicks") or 0) // TICKS_PER_MS
+        return MediaItem("emby", str(item["Id"]), key, self._state_of(item), item.get("Name", ""), alt_keys, duration)
 
     async def get_item(self, user_id: str, item_id: str) -> Optional[MediaItem]:
         data = await self._request("GET", f"/Users/{user_id}/Items/{item_id}", {"Fields": FIELDS})

@@ -10,6 +10,12 @@ mappings:
   # plex_user 留空表示 Plex 服务器所有者（你自己）
   - plex_user:
     emby_user: your-emby-username # Emby 用户名或用户 Id
+    trakt_user:                   # 可选：在 Web 页面授权后的 Trakt 用户名，留空不推送到 Trakt
+
+trakt:                            # 可选：自建 Trakt App，Redirect URI 填 urn:ietf:wg:oauth:2.0:oob
+  client_id:
+  client_secret:
+  scrobble: true                  # 实时推送播放进度到 Trakt；全量同步在 Web 页面手动执行
 
 sync:
   reconcile_interval: 900         # 定时对账间隔（秒）

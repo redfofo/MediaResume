@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { Connection, Delete, Plus } from '@element-plus/icons-vue'
 import { api, defaultConfig, type Config, type EmbyTest, type PlexTest, type Status } from '../api'
+import TraktAuthDialog from './TraktAuthDialog.vue'
 
 const emit = defineEmits<{ saved: [status: Status] }>()
 
@@ -17,6 +18,44 @@ const testing = reactive({ plex: false, emby: false })
 const plexAccounts = computed(() => (plexTest.value?.accounts ?? []).filter((a) => !a.owner))
 const plexOwner = computed(() => plexTest.value?.accounts?.find((a) => a.owner)?.name)
 const embyUsers = computed(() => embyTest.value?.users ?? [])
+
+const traktAccounts = ref<string[]>([])
+const traktDialog = ref(false)
+const traktReady = computed(() => !!(cfg.trakt.client_id.trim() && cfg.trakt.client_secret.trim()))
+
+async function loadTraktAccounts() {
+  try {
+    traktAccounts.value = (await api.traktAccounts()).accounts
+  } catch {
+    /* 忽略，下拉列表为空即可 */
+  }
+}
+
+function onTraktAuthorized(username: string) {
+  if (!traktAccounts.value.includes(username)) traktAccounts.value = [...traktAccounts.value, username].sort()
+  // 只有一个映射且尚未绑定时直接选上，省一步操作
+  if (cfg.mappings.length === 1 && !cfg.mappings[0].trakt_user) cfg.mappings[0].trakt_user = username
+}
+
+async function removeTraktAccount(username: string) {
+  try {
+    await ElMessageBox.confirm(`移除后需要重新授权才能再次推送到 Trakt 账户 ${username}。`, '移除 Trakt 授权', {
+      type: 'warning',
+      confirmButtonText: '移除',
+      cancelButtonText: '取消',
+    })
+  } catch {
+    return
+  }
+  try {
+    await api.traktDeleteAccount(username)
+    traktAccounts.value = traktAccounts.value.filter((u) => u !== username)
+    for (const m of cfg.mappings) if (m.trakt_user === username) m.trakt_user = null
+    ElMessage.success(`已移除 Trakt 账户 ${username} 的授权，相关映射已解绑，请保存配置`)
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
 
 async function testPlex(silent = false) {
   testing.plex = true
@@ -49,7 +88,7 @@ async function testEmby(silent = false) {
 }
 
 function addMapping() {
-  cfg.mappings.push({ plex_user: null, emby_user: '', plex_token: null })
+  cfg.mappings.push({ plex_user: null, emby_user: '', plex_token: null, trakt_user: null })
 }
 
 async function save() {
@@ -62,6 +101,7 @@ async function save() {
         emby_user: m.emby_user,
         // 所有者使用全局 token
         plex_token: m.plex_user ? m.plex_token || null : null,
+        trakt_user: m.trakt_user || null,
       })),
     }
     const res = await api.saveConfig(payload)
@@ -76,8 +116,8 @@ async function save() {
 
 onMounted(async () => {
   try {
-    const res = await api.getConfig()
-    if (res.config) Object.assign(cfg, res.config)
+    const [res] = await Promise.all([api.getConfig(), loadTraktAccounts()])
+    if (res.config) Object.assign(cfg, { ...res.config, trakt: { ...defaultConfig().trakt, ...res.config.trakt } })
     if (res.error) ElMessage.warning(`现有配置文件无效：${res.error}`)
     if (res.config) await Promise.all([testPlex(true), testEmby(true)])
   } catch (e) {
@@ -176,6 +216,13 @@ onMounted(async () => {
             </el-select>
           </template>
         </el-table-column>
+        <el-table-column label="Trakt 账户" min-width="160">
+          <template #default="{ row }">
+            <el-select v-model="row.trakt_user" clearable placeholder="不同步到 Trakt">
+              <el-option v-for="u in traktAccounts" :key="u" :label="u" :value="u" />
+            </el-select>
+          </template>
+        </el-table-column>
         <el-table-column width="70" align="center">
           <template #default="{ $index }">
             <el-button
@@ -188,6 +235,57 @@ onMounted(async () => {
           </template>
         </el-table-column>
       </el-table>
+    </el-card>
+
+    <el-card shadow="never">
+      <template #header>
+        <div class="card-header">
+          <span>Trakt（可选）</span>
+          <el-tag type="info">自动推送实时进度，全量同步手动执行</el-tag>
+        </div>
+      </template>
+      <el-alert type="info" :closable="false" class="hint">
+        <p>
+          在
+          <el-link type="primary" href="https://trakt.tv/oauth/applications/new" target="_blank">Trakt 新建 App</el-link>
+          ，Redirect URI 填写 <code>urn:ietf:wg:oauth:2.0:oob</code>，然后把 Client ID 和 Client Secret 填到下面。
+        </p>
+        <p>授权账户后，在上方“用户映射”中为每个映射选择要同步的 Trakt 账户。</p>
+      </el-alert>
+      <el-row :gutter="12">
+        <el-col :xs="24" :md="12">
+          <el-form-item label="Client ID">
+            <el-input v-model="cfg.trakt.client_id" placeholder="Trakt App 的 Client ID" />
+          </el-form-item>
+        </el-col>
+        <el-col :xs="24" :md="12">
+          <el-form-item label="Client Secret">
+            <el-input v-model="cfg.trakt.client_secret" type="password" show-password placeholder="Trakt App 的 Client Secret" />
+          </el-form-item>
+        </el-col>
+      </el-row>
+      <el-form-item label="实时推送播放进度">
+        <el-switch v-model="cfg.trakt.scrobble" />
+        <el-text type="info" class="switch-hint">
+          播放时 Trakt 显示“正在观看”，暂停 / 停止时保存进度，看完时记录一次观看
+        </el-text>
+      </el-form-item>
+      <el-text type="info" size="small" class="trakt-note">
+        已看记录和进度的全量同步不会自动进行，可在“运行状态”页的 Trakt 卡片中手动执行，两个方向都只会补充，不会改为未看或删除记录。
+      </el-text>
+      <div class="trakt-accounts">
+        <el-button :icon="Plus" :disabled="!traktReady" @click="traktDialog = true">授权 Trakt 账户</el-button>
+        <el-tag
+          v-for="u in traktAccounts"
+          :key="u"
+          closable
+          size="large"
+          @close="removeTraktAccount(u)"
+        >
+          {{ u }}
+        </el-tag>
+        <el-text v-if="!traktAccounts.length" type="info">尚未授权任何账户</el-text>
+      </div>
     </el-card>
 
     <el-card shadow="never">
@@ -236,6 +334,12 @@ onMounted(async () => {
       <el-button type="primary" size="large" :loading="saving" @click="save">保存并重启同步</el-button>
     </div>
   </el-form>
+  <TraktAuthDialog
+    v-model="traktDialog"
+    :client-id="cfg.trakt.client_id.trim()"
+    :client-secret="cfg.trakt.client_secret.trim()"
+    @authorized="onTraktAuthorized"
+  />
 </template>
 
 <style scoped>
@@ -259,6 +363,19 @@ onMounted(async () => {
 }
 .hint {
   margin-bottom: 12px;
+}
+.hint p {
+  margin: 0;
+}
+.trakt-note {
+  display: block;
+  margin-bottom: 12px;
+}
+.trakt-accounts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 .switch-hint {
   margin-left: 12px;

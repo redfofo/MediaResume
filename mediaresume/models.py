@@ -56,6 +56,8 @@ class MediaItem:
     title: str = ""
     # 一个文件包含多集时（如 S01E01-E02），除 key 外对应的其他集
     alt_keys: tuple[MediaKey, ...] = ()
+    # 片长（毫秒），用于与 Trakt 的百分比进度换算；未知为 0
+    duration_ms: int = 0
 
 
 def merge_states(items: list[MediaItem]) -> WatchState:
