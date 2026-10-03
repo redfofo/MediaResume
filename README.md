@@ -4,6 +4,8 @@ MediaResume 用于在 Plex 和 Emby 之间双向同步播放记录。
 
 在任意一端播放、暂停、标记已看或标记未看后，MediaResume 会找到另一端对应的电影或剧集，并同步观看状态和播放进度。项目提供中文 Web 管理页面，不需要手写配置文件。
 
+还可以选择接入 Trakt：实时推送播放进度，并在需要时手动与 Trakt 双向全量同步已看记录和进度。
+
 ## 功能
 
 - 双向同步电影和剧集的播放进度
@@ -26,13 +28,15 @@ MediaResume 用于在 Plex 和 Emby 之间双向同步播放记录。
 2. 可从该设备访问的 Plex 和 Emby 服务。
 3. Plex 服务器所有者的 `X-Plex-Token`。
 4. Emby 管理后台创建的 API Key。
+5. 可选：Trakt 账户，以及在 Trakt 上自建的 App（Client ID 和 Client Secret）。免费账户即可。
 
 获取凭据：
 
 - [Plex 官方：查找 X-Plex-Token](https://support.plex.tv/articles/204059436-finding-an-authentication-token-x-plex-token/)
 - [Emby 官方：创建 API Key](https://dev.emby.media/doc/restapi/API-Key-Authentication.html)
+- [Trakt：新建 App](https://trakt.tv/oauth/applications/new)，详见 [Trakt 同步](#trakt-同步可选)
 
-> Plex Token 和 Emby API Key 都具有账户访问权限。不要把它们提交到 Git、发到聊天记录或写入公开的 Compose 文件。
+> Plex Token、Emby API Key 和 Trakt Client Secret 都具有账户访问权限。不要把它们提交到 Git、发到聊天记录或写入公开的 Compose 文件。
 
 ## 快速开始
 
@@ -157,6 +161,7 @@ MEDIARESUME_PASSWORD=请替换为一个强密码
 7. 点击“保存并重启同步”。
 8. 在“运行状态”页观察日志和首次对账结果。
 9. 确认匹配和同步方向正确后，关闭 Dry-run，再次保存。
+10. 可选：按 [Trakt 同步](#trakt-同步可选) 的步骤接入 Trakt。
 
 保存后会在挂载目录中创建：
 
@@ -222,7 +227,9 @@ MediaResume 会同步：
 
 ## Trakt 同步（可选）
 
-MediaResume 以 Plex / Emby 合并后的状态为准与 Trakt 同步，不需要 Trakt VIP。
+接入 Trakt 后，MediaResume 会自动把实时播放进度推送到 Trakt；已看记录和历史进度的同步由你在页面上手动触发，两个方向都支持。不需要 Trakt VIP。
+
+容器需要能访问 `https://api.trakt.tv`。
 
 ### 配置步骤
 
@@ -280,6 +287,7 @@ MediaResume 以 Plex / Emby 合并后的状态为准与 Trakt 同步，不需要
 | 防回环窗口 | 10 秒 | 写入后忽略同一条目回传事件的时间 |
 | Dry-run | 新页面默认开启 | 记录操作但不实际修改媒体服务器 |
 | 日志级别 | INFO | 可选 DEBUG、INFO、WARNING、ERROR |
+| 实时推送播放进度到 Trakt | 开启 | 仅对绑定了 Trakt 账户的用户映射生效 |
 
 通常不需要修改这些默认值。媒体库较大或服务器性能较低时，可以适当增加轮询和对账间隔。
 
@@ -348,6 +356,20 @@ http://192.168.1.10:8096
 
 进入“配置”，关闭 Dry-run，点击“保存并重启同步”。
 
+### Trakt 授权失败
+
+- 提示“获取设备码失败（HTTP 401）”：Client ID 填写错误。
+- 输入授权码后一直等待：确认登录的是要同步的 Trakt 账户，并在授权码过期前完成授权；过期后点击“重新获取授权码”。
+- 状态页提示“授权已失效”或“授权属于其他 App”：更换过 Trakt App 或在 Trakt 上撤销了授权。在配置页重新授权该账户并保存。
+
+### Trakt 没有收到播放进度
+
+- 确认该用户映射已选择 Trakt 账户，且配置页的“实时推送播放进度”已开启。
+- 只推送 1%～79% 的进度；刚开始播放（不足 1%）暂停时不会推送。
+- Dry-run 模式下只记录日志，不会实际推送。
+- 在 Plex / Emby 中直接标记已看不会实时推送，需要执行“全量同步到 Trakt”。
+- 日志中出现“无法识别以下 TMDB ID”时，表示 Trakt 上没有对应条目，请检查媒体的 TMDB 元数据。
+
 ### 查看详细日志
 
 先在 Web 配置中把日志级别改为 `DEBUG`，再查看：
@@ -360,7 +382,7 @@ docker logs -f mediaresume
 
 - 建议始终设置 `MEDIARESUME_PASSWORD`。
 - 不要把 8095 端口直接暴露到公网；需要远程使用时，通过带 HTTPS 和身份认证的反向代理访问。
-- `config.yaml` 以明文保存 Plex Token 和 Emby API Key，请限制挂载目录的访问权限并妥善备份。
+- `config.yaml` 以明文保存 Plex Token、Emby API Key 和 Trakt Client Secret，`data/trakt_tokens.json` 保存 Trakt 授权信息，请限制挂载目录的访问权限并妥善备份。
 - 不要把 `config/`、`.env` 或数据库文件提交到 Git。仓库提供的 `.gitignore` 已默认排除这些文件。
 
 ## 开源许可证
