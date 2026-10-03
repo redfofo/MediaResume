@@ -22,11 +22,15 @@ class EmbyConfig:
 
 @dataclass
 class TraktConfig:
-    # 用户自建 Trakt App 的凭据，Redirect URI 填 urn:ietf:wg:oauth:2.0:oob
+    # 用户自建 Trakt App 的凭据，Redirect URI 填 urn:ietf:wg:oauth:2.0:oob。
+    # Trakt 新建的 App 不再发放 Client Secret，留空即可；旧 App 有的话可以填
     client_id: str = ""
     client_secret: str = ""
-    # 实时播放进度推送到 Trakt（正在观看 / 暂停进度 / 看完）；全量同步由页面手动触发
+    # 实时播放进度推送到 Trakt（正在观看 / 暂停进度 / 看完）
     scrobble: bool = True
+    # 定时全量同步到 Trakt / 从 Trakt 全量同步的间隔（小时），0 表示只手动执行
+    push_interval: int = 0
+    pull_interval: int = 0
 
 
 @dataclass
@@ -96,8 +100,14 @@ def parse_config(raw: dict[str, Any]) -> Config:
         **{k: v for k, v in trakt_raw.items() if k in TraktConfig.__dataclass_fields__ and v is not None},
     )
     trakt.client_id, trakt.client_secret = str(trakt.client_id).strip(), str(trakt.client_secret).strip()
-    if any(m.trakt_user for m in mappings) and not (trakt.client_id and trakt.client_secret):
-        raise ValueError("用户映射绑定了 Trakt 账户，需要填写 Trakt Client ID 和 Client Secret")
+    try:
+        trakt.push_interval, trakt.pull_interval = int(trakt.push_interval), int(trakt.pull_interval)
+    except (TypeError, ValueError):
+        raise ValueError("Trakt 定时全量同步间隔必须是整数（小时）") from None
+    if trakt.push_interval < 0 or trakt.pull_interval < 0:
+        raise ValueError("Trakt 定时全量同步间隔不能为负数")
+    if any(m.trakt_user for m in mappings) and not trakt.client_id:
+        raise ValueError("用户映射绑定了 Trakt 账户，需要填写 Trakt Client ID")
     sync_raw = raw.get("sync") or {}
     sync = SyncConfig(**{k: v for k, v in sync_raw.items() if k in SyncConfig.__dataclass_fields__})
     return Config(

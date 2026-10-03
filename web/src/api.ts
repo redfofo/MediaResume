@@ -12,6 +12,8 @@ export interface Config {
     client_id: string
     client_secret: string
     scrobble: boolean
+    push_interval: number
+    pull_interval: number
   }
   mappings: Mapping[]
   sync: {
@@ -55,6 +57,8 @@ export interface Status {
     reconcile: ReconcileStats | null
   }[]
   trakt: TraktStatus[]
+  // 定时全量同步的下次执行时间（unix 秒），未开启的方向没有
+  trakt_next: Partial<Record<TraktDirection, number>>
 }
 
 export interface TraktStatus {
@@ -212,7 +216,7 @@ export function defaultConfig(): Config {
   return {
     plex: { url: 'http://127.0.0.1:32400', token: '' },
     emby: { url: 'http://127.0.0.1:8096', api_key: '' },
-    trakt: { client_id: '', client_secret: '', scrobble: true },
+    trakt: { client_id: '', client_secret: '', scrobble: true, push_interval: 0, pull_interval: 0 },
     mappings: [{ plex_user: null, emby_user: '', plex_token: null, trakt_user: null }],
     sync: { reconcile_interval: 900, poll_interval: 30, unwatch_poll_interval: 120, progress_interval: 60, echo_window: 10, dry_run: true },
     db_path: 'data/state.db',

@@ -91,8 +91,14 @@ def run(coro):
 
 def test_parse_watched():
     movies = [{"movie": {"ids": {"tmdb": 603}}, "last_watched_at": "2023-11-14T22:13:20.000Z"}, {"movie": {"ids": {}}}]
-    shows = [{"show": {"ids": {"tmdb": 1399}}, "seasons": [{"number": 1, "episodes": [{"number": 1}, {"number": 2}]}]}]
-    assert parse_watched(movies, shows) == {MOVIE: 1_700_000_000, EP1: 0, EP2: 0}
+    show = {"ids": {"tmdb": 1399}}
+    history = [
+        {"type": "episode", "watched_at": "2023-11-14T22:13:20.000Z", "episode": {"season": 1, "number": 1}, "show": show},
+        {"type": "episode", "watched_at": "2023-11-15T22:13:20.000Z", "episode": {"season": 1, "number": 1}, "show": show},
+        {"type": "episode", "episode": {"season": 1, "number": 2}, "show": show},
+        {"type": "episode", "episode": {"season": 1, "number": 3}, "show": {"ids": {}}},
+    ]
+    assert parse_watched(movies, history) == {MOVIE: 1_700_000_000, EP1: 1_700_086_400, EP2: 0}
 
 
 def test_parse_playback_keeps_latest():
@@ -291,6 +297,21 @@ def test_plan_to_trakt(tmp_path):
     assert show["progress"][0]["trakt_pct"] is None
 
 
+def test_scheduled_waits_for_reconcile_then_executes(tmp_path):
+    client = FakeClient()
+    eng, pair, *_ = make_engine(tmp_path, [MediaItem("plex", "1", MOVIE, played(), "M")], [], client=client)
+    run(eng.trakt_scheduled("to_trakt"))  # 尚未对账：跳过
+    assert client.posts == [] and not eng._background
+    run(eng._reconcile(pair))
+
+    async def scheduled():
+        await eng.trakt_scheduled("to_trakt")
+        await asyncio.gather(*eng._background)
+
+    run(scheduled())
+    assert client.posts and client.posts[0]["movies"][0]["ids"] == {"tmdb": 603}
+
+
 def test_plan_from_trakt(tmp_path):
     client = FakeClient(
         watched={EP1},
@@ -354,35 +375,60 @@ def test_client_refreshes_expired_token(tmp_path, monkeypatch):
     from mediaresume.trakt import TraktClient, TraktTokenStore
 
     seen = []
+    refreshed = 0
 
     async def token(request):
         body = await request.json()
         assert body["grant_type"] == "refresh_token" and body["refresh_token"] == "r1"
+        assert body["client_secret"] == "secret"
+        nonlocal refreshed
+        refreshed += 1
         return web.json_response({"access_token": "a2", "refresh_token": "r2", "expires_in": 86400, "created_at": int(time.time())})
 
     async def watched(request):
         seen.append(request.headers["Authorization"])
-        if request.match_info["type"] == "movies":
-            return web.json_response([{"movie": {"ids": {"tmdb": 603}}}])
-        return web.json_response([])
+        return web.json_response([{"movie": {"ids": {"tmdb": 603}}}])
+
+    async def history(request):
+        # 第 1 页满页、第 2 页不满：应取到两页且不再请求后续页
+        page = int(request.query["page"])
+        pages.append(page)
+        n = trakt.PAGE_LIMIT if page == 1 else 1 if page == 2 else 0
+        ep = {"type": "episode", "episode": {"season": 1, "number": page}, "show": {"ids": {"tmdb": 1399}}}
+        return web.json_response([ep] * n)
+
+    pages = []
 
     async def main():
         app = web.Application()
         app.router.add_post("/oauth/token", token)
-        app.router.add_get("/sync/watched/{type}", watched)
+        app.router.add_get("/sync/watched/movies", watched)
+        app.router.add_get("/sync/history/episodes", history)
         async with TestServer(app) as server:
             monkeypatch.setattr(trakt, "API", str(server.make_url("")).rstrip("/"))
             store = TraktTokenStore(tmp_path / "tokens.json")
             store.set("me", {"access_token": "a1", "refresh_token": "r1", "expires_at": int(time.time()) + 60, "client_id": "cid"})
             async with aiohttp.ClientSession() as http:
                 client = TraktClient(http, TraktConfig("cid", "secret"), store)
-                assert await client.watched("me") == {MOVIE: 0}
+                assert await client.watched("me") == {MOVIE: 0, EP1: 0, EP2: 0}
             return store
 
+    monkeypatch.setattr(trakt, "PAGE_LIMIT", 3)
+    monkeypatch.setattr(trakt, "PAGE_CONCURRENCY", 2)
     store = run(main())
-    assert seen == ["Bearer a2", "Bearer a2"]
+    # 两个接口各并发 2 页，token 只刷新一次
+    assert seen == ["Bearer a2"] * 2 and refreshed == 1
+    assert sorted(pages) == [1, 2]
     assert store.get("me")["refresh_token"] == "r2"
     assert (tmp_path / "tokens.json").stat().st_mode & 0o777 == 0o600
+
+
+def test_client_omits_missing_secret(tmp_path):
+    from mediaresume.trakt import TraktClient, TraktTokenStore
+
+    store = TraktTokenStore(tmp_path / "tokens.json")
+    assert TraktClient(None, TraktConfig("cid", ""), store)._with_secret({"client_id": "cid"}) == {"client_id": "cid"}
+    assert TraktClient(None, TraktConfig("cid", "s"), store)._with_secret({})["client_secret"] == "s"
 
 
 def test_client_rejects_token_from_other_app(tmp_path):
@@ -401,6 +447,8 @@ BASE = {"plex": {"url": "http://p", "token": "t"}, "emby": {"url": "http://e", "
 def test_config_requires_trakt_credentials_when_bound():
     with pytest.raises(ValueError):
         parse_config({**BASE, "mappings": [{"emby_user": "u", "trakt_user": "me"}]})
+    # 新建的 Trakt App 没有 Client Secret
+    assert parse_config({**BASE, "mappings": [{"emby_user": "u", "trakt_user": "me"}], "trakt": {"client_id": "a"}}).trakt.client_secret == ""
     cfg = parse_config({
         **BASE,
         "mappings": [{"emby_user": "u", "trakt_user": "me"}],
@@ -409,4 +457,13 @@ def test_config_requires_trakt_credentials_when_bound():
     assert cfg.mappings[0].trakt_user == "me"
     assert cfg.trakt.client_id == "a" and not cfg.trakt.scrobble
     assert parse_config({**BASE, "mappings": [{"emby_user": "u"}]}).mappings[0].trakt_user is None
+    assert cfg.trakt.push_interval == cfg.trakt.pull_interval == 0
+
+
+def test_config_trakt_schedule():
+    cfg = parse_config({**BASE, "mappings": [{"emby_user": "u"}], "trakt": {"push_interval": "6", "pull_interval": 24}})
+    assert (cfg.trakt.push_interval, cfg.trakt.pull_interval) == (6, 24)
+    for bad in (-1, "x"):
+        with pytest.raises(ValueError):
+            parse_config({**BASE, "mappings": [{"emby_user": "u"}], "trakt": {"push_interval": bad}})
 

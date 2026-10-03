@@ -162,6 +162,14 @@ onUnmounted(() => window.clearInterval(timer))
           </div>
         </div>
       </template>
+      <div v-if="status.trakt_next.to_trakt || status.trakt_next.from_trakt" class="trakt-next">
+        <el-text v-if="status.trakt_next.to_trakt" type="info" size="small">
+          下次定时同步到 Trakt：{{ fmtTime(status.trakt_next.to_trakt) }}
+        </el-text>
+        <el-text v-if="status.trakt_next.from_trakt" type="info" size="small">
+          下次定时从 Trakt 同步：{{ fmtTime(status.trakt_next.from_trakt) }}
+        </el-text>
+      </div>
       <el-table :data="status.trakt">
         <el-table-column prop="user" label="账户" min-width="120" />
         <el-table-column label="最近推送" min-width="170">
@@ -246,5 +254,11 @@ onUnmounted(() => window.clearInterval(timer))
 .log-msg {
   white-space: pre-wrap;
   word-break: break-all;
+}
+.trakt-next {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 24px;
+  margin-bottom: 8px;
 }
 </style>

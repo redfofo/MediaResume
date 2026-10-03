@@ -4,7 +4,7 @@ MediaResume 用于在 Plex 和 Emby 之间双向同步播放记录。
 
 在任意一端播放、暂停、标记已看或标记未看后，MediaResume 会找到另一端对应的电影或剧集，并同步观看状态和播放进度。项目提供中文 Web 管理页面，不需要手写配置文件。
 
-还可以选择接入 Trakt：实时推送播放进度，并在需要时手动与 Trakt 双向全量同步已看记录和进度。
+还可以选择接入 Trakt：实时推送播放进度，并手动或定时与 Trakt 双向全量同步已看记录和进度。
 
 ## 功能
 
@@ -12,7 +12,7 @@ MediaResume 用于在 Plex 和 Emby 之间双向同步播放记录。
 - 双向同步“已看 / 未看”状态
 - 检测并同步从“继续观看”中移除的条目
 - 手动预览并同步两端的“继续观看”列表
-- 可选：实时推送播放进度到 Trakt，手动与 Trakt 全量同步已看记录和进度
+- 可选：实时推送播放进度到 Trakt，手动或定时与 Trakt 全量同步已看记录和进度
 - 支持多个 Plex 用户与 Emby 用户映射
 - Plex 播放事件通过 WebSocket 接收，其他变化通过增量轮询发现
 - 定时全量对账，修复服务离线期间遗漏的变化
@@ -28,7 +28,7 @@ MediaResume 用于在 Plex 和 Emby 之间双向同步播放记录。
 2. 可从该设备访问的 Plex 和 Emby 服务。
 3. Plex 服务器所有者的 `X-Plex-Token`。
 4. Emby 管理后台创建的 API Key。
-5. 可选：Trakt 账户，以及在 Trakt 上自建的 App（Client ID 和 Client Secret）。免费账户即可。
+5. 可选：Trakt 账户，以及在 Trakt 上自建的 App（Client ID）。免费账户即可。
 
 获取凭据：
 
@@ -227,7 +227,7 @@ MediaResume 会同步：
 
 ## Trakt 同步（可选）
 
-接入 Trakt 后，MediaResume 会自动把实时播放进度推送到 Trakt；已看记录和历史进度的同步由你在页面上手动触发，两个方向都支持。不需要 Trakt VIP。
+接入 Trakt 后，MediaResume 会自动把实时播放进度推送到 Trakt；已看记录和历史进度的同步由你在页面上手动触发，也可以配置为定时执行，两个方向都支持。不需要 Trakt VIP。
 
 容器需要能访问 `https://api.trakt.tv`。
 
@@ -236,8 +236,9 @@ MediaResume 会同步：
 1. 登录 Trakt，打开 [新建 App](https://trakt.tv/oauth/applications/new)：
    - Name 任意填写，例如 `MediaResume`；
    - Redirect URI 填写 `urn:ietf:wg:oauth:2.0:oob`；
-   - 其余选项保持默认，保存后得到 Client ID 和 Client Secret。
-2. 在 MediaResume 的“配置”页填写 Trakt Client ID 和 Client Secret。
+   - 其余选项保持默认，保存后得到 Client ID。
+   - 新建的 App 不再提供 Client Secret（显示“Not issued”），这是正常的，MediaResume 不需要它；较早创建、带 Secret 的 App 也可以继续使用。
+2. 在 MediaResume 的“配置”页填写 Trakt Client ID（有 Client Secret 的旧 App 可一并填写）。
 3. 点击“授权 Trakt 账户”，按提示打开 Trakt 网页并输入授权码。多个家庭成员可以分别授权各自的 Trakt 账户。
 4. 在“用户映射”中为需要同步的映射选择 Trakt 账户。
 5. 点击“保存并重启同步”，在“运行状态”页的 Trakt 卡片和日志中查看结果。
@@ -249,12 +250,14 @@ MediaResume 会同步：
 
 - Plex 播放时，Trakt 显示“正在观看”；暂停或停止时保存进度。
 - 本次运行中推送过进度的条目播放完成后，Trakt 记录一次观看。
-- 在 Plex / Emby 中直接标记已看，不会自动同步到 Trakt，需要执行全量同步。
+- 在 Plex / Emby 中直接标记已看，不会实时同步到 Trakt，需要执行全量同步（手动或定时）。
 - Emby 没有可用的实时播放事件，Emby 上的播放只推送暂停进度，不显示“正在观看”。
 
-### 手动：全量同步
+### 手动 / 定时：全量同步
 
 在“运行状态”页的 Trakt 卡片中执行。两个方向都先预览，确认后在后台执行，进度和结果在日志中查看。全量同步基于最近一次对账的结果。
+
+也可以在“配置”页为两个方向分别设置定时间隔（小时，对应 `trakt.push_interval` / `trakt.pull_interval`），0 表示只手动执行。开启后，同步引擎每次启动都会重新计时，每隔该时长执行一次，效果与手动确认执行相同；尚未完成首次对账或已有全量同步在执行时跳过当轮。下次执行时间显示在 Trakt 卡片中。
 
 | 按钮 | 已看记录 | 播放进度 |
 | --- | --- | --- |

@@ -95,6 +95,8 @@ class SyncEngine:
         # pair_id -> 最近一次对账结果，供 Web 状态页展示
         self.reconcile_stats: dict[str, dict] = {}
         self.reconciling = False
+        # Trakt 定时全量同步的下次执行时间（unix 秒）：方向 -> 时间
+        self.trakt_next: dict[str, float] = {}
         self.last_poll: Optional[float] = None
         self.poll_error: Optional[str] = None
 
@@ -117,6 +119,9 @@ class SyncEngine:
         tasks = [self._worker(), self._reconcile_timer(), self._poll_loop(), self.plex.listen(self.on_plex_playing)]
         if self.trakt and self.trakt.accounts:
             tasks.append(self.trakt.run())
+            for direction, hours in (("to_trakt", self.cfg.trakt.push_interval), ("from_trakt", self.cfg.trakt.pull_interval)):
+                if hours > 0:
+                    tasks.append(self._trakt_timer(direction, hours * 3600))
         try:
             await asyncio.gather(*tasks)
         finally:
@@ -618,6 +623,27 @@ class SyncEngine:
         else:
             self.queue.put_nowait(("trakt_pull", pair, *plan))
         return {k: len(v) if isinstance(v, list) else v for k, v in show.items()}
+
+    async def _trakt_timer(self, direction: str, interval: float) -> None:
+        while True:
+            self.trakt_next[direction] = time.time() + interval
+            await asyncio.sleep(interval)
+            await self.trakt_scheduled(direction)
+
+    async def trakt_scheduled(self, direction: str) -> None:
+        """定时全量同步：与页面手动执行相同；尚未完成首次对账或已有全量同步在执行时跳过本轮"""
+        name = "全量同步到 Trakt" if direction == "to_trakt" else "从 Trakt 全量同步"
+        for pair in self.pairs:
+            if not pair.mapping.trakt_user:
+                continue
+            if not pair.unified:
+                log.info("[%s] 定时%s跳过：尚未完成首次对账", pair.id, name)
+                continue
+            log.info("[%s] 定时%s", pair.id, name)
+            try:
+                await self.trakt_execute(pair, direction)
+            except Exception as e:
+                log.warning("[%s] 定时%s失败: %s", pair.id, name, e)
 
     async def _trakt_pull(
         self, pair: Pair, watched: dict[MediaKey, int], progress: dict[MediaKey, tuple[float, int]]

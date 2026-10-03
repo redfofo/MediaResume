@@ -36,6 +36,8 @@ RETRY_MIN, RETRY_MAX = 60, 900
 PROGRESS_MIN, PROGRESS_MAX = 1.0, 80.0
 # 进度变化小于此百分比不重复推送
 PROGRESS_STEP = 1.0
+# 列表接口的分页大小（Trakt 上限 250）与并发拉取的页数
+PAGE_LIMIT, PAGE_CONCURRENCY = 250, 8
 
 
 class TraktAuthError(Exception):
@@ -97,6 +99,8 @@ class TraktClient:
         self.cfg = cfg
         self.tokens = tokens
         self._write_lock = asyncio.Lock()
+        # 并发请求只刷新一次 token：旧 refresh_token 刷新后即失效
+        self._refresh_lock = asyncio.Lock()
         self._last_write = 0.0
 
     def _headers(self, access_token: Optional[str] = None) -> dict:
@@ -135,8 +139,12 @@ class TraktClient:
 
     async def device_token(self, device_code: str) -> tuple[int, Optional[dict]]:
         """返回 (HTTP 状态码, token 响应)；400 表示用户尚未完成授权"""
-        body = {"code": device_code, "client_id": self.cfg.client_id, "client_secret": self.cfg.client_secret}
+        body = self._with_secret({"code": device_code, "client_id": self.cfg.client_id})
         return await self._raw("POST", "/oauth/device/token", body)
+
+    def _with_secret(self, body: dict) -> dict:
+        """Trakt 新建的 App 不再发放 Client Secret（已弃用、可选），旧 App 填了才发送"""
+        return {**body, "client_secret": self.cfg.client_secret} if self.cfg.client_secret else body
 
     async def username_of(self, access_token: str) -> str:
         status, data = await self._raw("GET", "/users/settings", access_token=access_token)
@@ -146,22 +154,23 @@ class TraktClient:
 
     # ---------- 带用户 token 的请求 ----------
 
-    async def _access_token(self, username: str) -> str:
-        tok = self.tokens.get(username)
-        if not tok or tok.get("client_id") != self.cfg.client_id:
-            raise TraktAuthError(f"Trakt 账户 {username} 未授权或授权属于其他 App，请在配置页重新授权")
-        if tok["expires_at"] - time.time() < REFRESH_MARGIN:
-            tok = await self._refresh(username, tok)
-        return tok["access_token"]
+    async def _access_token(self, username: str, rejected: Optional[str] = None) -> str:
+        """rejected：被服务器拒绝（401）的 access_token，仍是当前 token 时强制刷新"""
+        async with self._refresh_lock:
+            tok = self.tokens.get(username)
+            if not tok or tok.get("client_id") != self.cfg.client_id:
+                raise TraktAuthError(f"Trakt 账户 {username} 未授权或授权属于其他 App，请在配置页重新授权")
+            if tok["expires_at"] - time.time() < REFRESH_MARGIN or tok["access_token"] == rejected:
+                tok = await self._refresh(username, tok)
+            return tok["access_token"]
 
     async def _refresh(self, username: str, tok: dict) -> dict:
-        body = {
+        body = self._with_secret({
             "refresh_token": tok["refresh_token"],
             "client_id": self.cfg.client_id,
-            "client_secret": self.cfg.client_secret,
             "redirect_uri": REDIRECT_URI,
             "grant_type": "refresh_token",
-        }
+        })
         status, data = await self._raw("POST", "/oauth/token", body)
         if status in (400, 401):
             raise TraktAuthError(f"Trakt 账户 {username} 的授权已失效，请在配置页重新授权")
@@ -187,11 +196,11 @@ class TraktClient:
         return await self._user_request_once(username, method, path, body, ok)
 
     async def _user_request_once(self, username: str, method: str, path: str, body: Any, ok: tuple[int, ...]) -> Any:
-        status, data = await self._raw(method, path, body, await self._access_token(username))
+        access_token = await self._access_token(username)
+        status, data = await self._raw(method, path, body, access_token)
         if status == 401:
             # token 可能被提前吊销，强制刷新一次
-            tok = await self._refresh(username, self.tokens.get(username) or {})
-            status, data = await self._raw(method, path, body, tok["access_token"])
+            status, data = await self._raw(method, path, body, await self._access_token(username, access_token))
             if status == 401:
                 raise TraktAuthError(f"Trakt 账户 {username} 的授权已失效，请在配置页重新授权")
         if status >= 400 and status not in ok:
@@ -201,16 +210,32 @@ class TraktClient:
     async def last_activities(self, username: str) -> dict:
         return await self._user_request(username, "GET", "/sync/last_activities") or {}
 
+    async def _user_pages(self, username: str, path: str) -> list:
+        """取分页接口的全部结果：不带 page 参数时 Trakt 只返回第一页。按批并发拉取，遇到不满一页即结束"""
+        out: list = []
+        page = 1
+        while True:
+            pages = await asyncio.gather(*(
+                self._user_request(username, "GET", f"{path}?page={p}&limit={PAGE_LIMIT}")
+                for p in range(page, page + PAGE_CONCURRENCY)
+            ))
+            for data in pages:
+                out.extend(data or [])
+                if len(data or []) < PAGE_LIMIT:
+                    return out
+            page += PAGE_CONCURRENCY
+
     async def watched(self, username: str) -> dict[MediaKey, int]:
-        movies = await self._user_request(username, "GET", "/sync/watched/movies")
-        shows = await self._user_request(username, "GET", "/sync/watched/shows")
-        return parse_watched(movies or [], shows or [])
+        movies = await self._user_pages(username, "/sync/watched/movies")
+        # /sync/watched/shows 已不再返回各季各集，剧集的已看从观看历史汇总
+        episodes = await self._user_pages(username, "/sync/history/episodes")
+        return parse_watched(movies, episodes)
 
     async def add_history(self, username: str, payload: dict) -> dict:
         return await self._user_request(username, "POST", "/sync/history", payload) or {}
 
     async def playback(self, username: str) -> dict[MediaKey, "Playback"]:
-        return parse_playback(await self._user_request(username, "GET", "/sync/playback") or [])
+        return parse_playback(await self._user_pages(username, "/sync/playback"))
 
     async def remove_playback(self, username: str, playback_id: int) -> None:
         await self._user_request(username, "DELETE", f"/sync/playback/{playback_id}", ok=(404,))
@@ -246,21 +271,17 @@ def _iso(ts: int) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
-def parse_watched(movies: list[dict], shows: list[dict]) -> dict[MediaKey, int]:
-    """Trakt 已看列表 -> {MediaKey: 最后观看时间}"""
+def parse_watched(movies: list[dict], history: list[dict]) -> dict[MediaKey, int]:
+    """Trakt 已看电影列表 + 剧集观看历史 -> {MediaKey: 最后观看时间}"""
     out: dict[MediaKey, int] = {}
     for m in movies:
         tmdb = ((m.get("movie") or {}).get("ids") or {}).get("tmdb")
         if tmdb:
             out[MediaKey("movie", str(tmdb))] = _parse_ts(m.get("last_watched_at"))
-    for s in shows:
-        tmdb = ((s.get("show") or {}).get("ids") or {}).get("tmdb")
-        if not tmdb:
-            continue
-        for season in s.get("seasons") or []:
-            for ep in season.get("episodes") or []:
-                key = MediaKey("episode", str(tmdb), int(season["number"]), int(ep["number"]))
-                out[key] = _parse_ts(ep.get("last_watched_at"))
+    for e in history:
+        key = _entry_key(e)
+        if key is not None:
+            out[key] = max(out.get(key, 0), _parse_ts(e.get("watched_at")))
     return out
 
 
@@ -378,7 +399,7 @@ class TraktAccount:
 
 class TraktSync:
     """自动部分只有一件事：实时播放进度推送到 Trakt（scrobble）。
-    已看记录和进度的全量同步由页面手动触发：引擎生成计划，推送由 push_full 执行，拉回由引擎写入 Plex / Emby。"""
+    已看记录和进度的全量同步由页面手动或引擎定时触发：引擎生成计划，推送由 push_full 执行，拉回由引擎写入 Plex / Emby。"""
 
     def __init__(self, client: TraktClient, cfg: TraktConfig, dry_run: bool):
         self.client = client

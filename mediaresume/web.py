@@ -140,6 +140,7 @@ class Runner:
                 for p in (eng.pairs if running and eng else [])
             ],
             "trakt": eng.trakt.status() if running and eng and eng.trakt else [],
+            "trakt_next": eng.trakt_next if running and eng else {},
         }
 
 
@@ -210,12 +211,12 @@ def create_app(runner: Runner, logs: LogBuffer, dist: Path) -> web.Application:
         return web.json_response({"ok": True, **info, "users": users})
 
     # ---------- Trakt 设备码授权 ----------
-    # 页面上的 Client ID / Secret 可能尚未保存，因此由请求携带
+    # 页面上的 Client ID / Secret 可能尚未保存，因此由请求携带；Secret 可选
 
     def _trakt_client(body: dict) -> TraktClient:
         cfg = TraktConfig(str(body.get("client_id") or "").strip(), str(body.get("client_secret") or "").strip())
-        if not (cfg.client_id and cfg.client_secret):
-            raise web.HTTPBadRequest(text='{"error": "请先填写 Trakt Client ID 和 Client Secret"}', content_type="application/json")
+        if not cfg.client_id:
+            raise web.HTTPBadRequest(text='{"error": "请先填写 Trakt Client ID"}', content_type="application/json")
         return TraktClient(runner.http, cfg, runner.trakt_tokens)
 
     @routes.get("/api/trakt/accounts")

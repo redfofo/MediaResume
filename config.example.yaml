@@ -14,8 +14,10 @@ mappings:
 
 trakt:                            # 可选：自建 Trakt App，Redirect URI 填 urn:ietf:wg:oauth:2.0:oob
   client_id:
-  client_secret:
-  scrobble: true                  # 实时推送播放进度到 Trakt；全量同步在 Web 页面手动执行
+  client_secret:                  # 可选：新建的 App 不再提供 Secret（显示 Not issued），留空即可
+  scrobble: true                  # 实时推送播放进度到 Trakt
+  push_interval: 0                # 定时全量同步到 Trakt 的间隔（小时），0 表示只在 Web 页面手动执行
+  pull_interval: 0                # 定时从 Trakt 全量同步的间隔（小时），0 表示只在 Web 页面手动执行
 
 sync:
   reconcile_interval: 900         # 定时对账间隔（秒）

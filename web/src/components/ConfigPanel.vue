@@ -21,7 +21,7 @@ const embyUsers = computed(() => embyTest.value?.users ?? [])
 
 const traktAccounts = ref<string[]>([])
 const traktDialog = ref(false)
-const traktReady = computed(() => !!(cfg.trakt.client_id.trim() && cfg.trakt.client_secret.trim()))
+const traktReady = computed(() => !!cfg.trakt.client_id.trim())
 
 async function loadTraktAccounts() {
   try {
@@ -241,14 +241,15 @@ onMounted(async () => {
       <template #header>
         <div class="card-header">
           <span>Trakt（可选）</span>
-          <el-tag type="info">自动推送实时进度，全量同步手动执行</el-tag>
+          <el-tag type="info">自动推送实时进度，全量同步手动或定时执行</el-tag>
         </div>
       </template>
       <el-alert type="info" :closable="false" class="hint">
         <p>
           在
           <el-link type="primary" href="https://trakt.tv/oauth/applications/new" target="_blank">Trakt 新建 App</el-link>
-          ，Redirect URI 填写 <code>urn:ietf:wg:oauth:2.0:oob</code>，然后把 Client ID 和 Client Secret 填到下面。
+          ，Redirect URI 填写 <code>urn:ietf:wg:oauth:2.0:oob</code>，然后把 Client ID 填到下面。
+          新建的 App 不再提供 Client Secret（页面显示 Not issued），留空即可；较早创建、有 Secret 的 App 也可以填上。
         </p>
         <p>授权账户后，在上方“用户映射”中为每个映射选择要同步的 Trakt 账户。</p>
       </el-alert>
@@ -259,8 +260,8 @@ onMounted(async () => {
           </el-form-item>
         </el-col>
         <el-col :xs="24" :md="12">
-          <el-form-item label="Client Secret">
-            <el-input v-model="cfg.trakt.client_secret" type="password" show-password placeholder="Trakt App 的 Client Secret" />
+          <el-form-item label="Client Secret（可选）">
+            <el-input v-model="cfg.trakt.client_secret" type="password" show-password placeholder="新建的 App 没有 Secret，留空即可" />
           </el-form-item>
         </el-col>
       </el-row>
@@ -270,8 +271,21 @@ onMounted(async () => {
           播放时 Trakt 显示“正在观看”，暂停 / 停止时保存进度，看完时记录一次观看
         </el-text>
       </el-form-item>
+      <el-row :gutter="24">
+        <el-col :xs="24" :sm="12">
+          <el-form-item label="定时全量同步到 Trakt（小时）">
+            <el-input-number v-model="cfg.trakt.push_interval" :min="0" :step="1" step-strictly />
+          </el-form-item>
+        </el-col>
+        <el-col :xs="24" :sm="12">
+          <el-form-item label="定时从 Trakt 全量同步（小时）">
+            <el-input-number v-model="cfg.trakt.pull_interval" :min="0" :step="1" step-strictly />
+          </el-form-item>
+        </el-col>
+      </el-row>
       <el-text type="info" size="small" class="trakt-note">
-        已看记录和进度的全量同步不会自动进行，可在“运行状态”页的 Trakt 卡片中手动执行，两个方向都只会补充，不会改为未看或删除记录。
+        已看记录和进度的全量同步可在“运行状态”页的 Trakt 卡片中手动执行；上面的间隔填 0 表示只手动执行，大于 0 时引擎启动后每隔该时长自动执行一次（不预览，直接执行）。
+        两个方向都只会补充，不会改为未看或删除记录。
       </el-text>
       <div class="trakt-accounts">
         <el-button :icon="Plus" :disabled="!traktReady" @click="traktDialog = true">授权 Trakt 账户</el-button>
