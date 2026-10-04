@@ -89,6 +89,7 @@ export interface TraktPlan {
   // from_trakt
   watched?: TraktPlanEntry[]
   skipped_newer?: number
+  kept_unwatched?: number
   // 两个方向都有
   progress: TraktPlanEntry[]
 }

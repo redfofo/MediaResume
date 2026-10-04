@@ -329,10 +329,34 @@ def test_plan_from_trakt(tmp_path):
         client=client,
     )
     run(eng._reconcile(pair))
-    show, (watched, prog) = run(eng.trakt_plan(pair, "from_trakt"))
+    show, (watched, prog, seen) = run(eng.trakt_plan(pair, "from_trakt"))
     assert watched == {EP1: NOW}
     assert prog == {EP2: (50, NOW)}
     assert show["skipped_newer"] == 1
+    assert seen == {EP1: NOW}
+
+
+def test_pull_keeps_local_unwatched_after_seen(tmp_path):
+    # 上次拉取已见过 EP1 的观看记录，之后本地标为未看（准备重看）：不再改回已看
+    client = FakeClient(watched={EP1, EP2})
+    eng, pair, plex, *_ = make_engine(
+        tmp_path,
+        [MediaItem("plex", "1", EP1, WatchState(False, 0)), MediaItem("plex", "2", EP2, WatchState(False, 0))],
+        [],
+        client=client,
+    )
+    eng.store.set_trakt_seen(pair.id, {EP1: NOW, EP2: NOW - 100})
+    run(eng._reconcile(pair))
+    show, (watched, _, _) = run(eng.trakt_plan(pair, "from_trakt"))
+    assert watched == {EP2: NOW}  # EP2 在 Trakt 上有新的观看
+    assert show["kept_unwatched"] == 1
+
+
+def test_pull_records_seen(tmp_path):
+    eng, pair, plex, *_ = make_engine(tmp_path, [MediaItem("plex", "1", EP1, WatchState(False, 0))], [])
+    pair.plex_index[EP1] = ["1"]
+    run(eng._trakt_pull(pair, {EP1: NOW}, {}, {EP1: NOW, EP2: NOW - 5}))
+    assert eng.store.trakt_seen(pair.id) == {str(EP1): NOW, str(EP2): NOW - 5}
 
 
 def test_trakt_pull_applies_to_both_sides(tmp_path):
@@ -355,10 +379,10 @@ def test_live_events_push_progress(tmp_path):
     eng, pair, plex, emby, acc = make_engine(tmp_path, [], [item])
     pair.plex_index[EP1] = ["1"]
     # Plex 正在播放时，Emby 的变化是同步过去的，不推送“暂停”
-    eng._plex_playing["1"] = time.monotonic()
+    eng._plex_playing[(pair.id, "1")] = time.monotonic()
     run(eng._handle_event("emby", pair, "a"))
     assert acc.pending == {}
-    del eng._plex_playing["1"]
+    del eng._plex_playing[(pair.id, "1")]
     run(eng._handle_event("emby", pair, "a"))
     assert acc.pending[EP1][1] == "stop"
 

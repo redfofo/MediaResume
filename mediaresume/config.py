@@ -35,7 +35,7 @@ class TraktConfig:
 
 @dataclass
 class Mapping:
-    # Plex 用户名（为空表示服务器所有者 / 接受所有会话）
+    # Plex 用户名（为空表示服务器所有者）
     plex_user: Optional[str]
     # Emby 用户名或用户 Id
     emby_user: str

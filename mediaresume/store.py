@@ -27,6 +27,17 @@ class StateStore:
             )
             """
         )
+        # 已见过的 Trakt 观看记录（最后观看时间），从 Trakt 拉取时只同步之后新增的观看
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trakt_seen (
+                pair TEXT NOT NULL,
+                media_key TEXT NOT NULL,
+                watched_at INTEGER NOT NULL,
+                PRIMARY KEY (pair, media_key)
+            )
+            """
+        )
         self.conn.commit()
 
     def get(self, pair: str, key: MediaKey) -> Optional[WatchState]:
@@ -48,6 +59,20 @@ class StateStore:
                 last_played=excluded.last_played, updated_at=excluded.updated_at
             """,
             (pair, str(key), int(state.played), state.position_ms, state.last_played, int(time.time())),
+        )
+        self.conn.commit()
+
+    def trakt_seen(self, pair: str) -> dict[str, int]:
+        rows = self.conn.execute("SELECT media_key, watched_at FROM trakt_seen WHERE pair=?", (pair,))
+        return {k: ts for k, ts in rows}
+
+    def set_trakt_seen(self, pair: str, seen: dict[MediaKey, int]) -> None:
+        self.conn.executemany(
+            """
+            INSERT INTO trakt_seen (pair, media_key, watched_at) VALUES (?, ?, ?)
+            ON CONFLICT(pair, media_key) DO UPDATE SET watched_at=max(watched_at, excluded.watched_at)
+            """,
+            [(pair, str(k), ts) for k, ts in seen.items()],
         )
         self.conn.commit()
 

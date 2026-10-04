@@ -18,6 +18,10 @@ log = logging.getLogger("engine")
 
 # 定向查找确认“另一端没有”的条目，在此时间内不再查找（秒）；全量对账重建索引时也会清空
 MISSING_TTL = 600
+# 一轮中继续观看列表少了大半（且至少这么多项）时，视为服务器异常而非手动移除
+RESUME_BULK_MIN = 3
+# 引擎初始化失败（如 Emby 尚未启动）的重试间隔（秒）
+SETUP_RETRY_MIN, SETUP_RETRY_MAX = 10, 300
 
 
 def decide(plex: WatchState, emby: WatchState, base: Optional[WatchState]) -> Optional[WatchState]:
@@ -59,6 +63,8 @@ class Pair:
     # 上一轮的继续观看列表：分组(movie:tmdb:X / show:tmdb:X) -> 条目 id
     plex_resume: Optional[dict[str, list[str]]] = None
     emby_resume: Optional[dict[str, list[str]]] = None
+    # 上一轮刚从继续观看中消失的分组，下一轮仍不在才确认为移除：服务器 -> 分组 -> 条目 id
+    resume_gone: dict[str, dict[str, list[str]]] = field(default_factory=lambda: {"plex": {}, "emby": {}})
     # 最近一次得到的统一状态：MediaKey -> (状态, 标题, 片长)，供 Trakt 全量同步生成计划
     unified: dict[MediaKey, tuple[WatchState, str, int]] = field(default_factory=dict)
 
@@ -66,9 +72,10 @@ class Pair:
     def id(self) -> str:
         return f"{self.mapping.plex_user or '@owner'}|{self.emby_user_id}"
 
-    def accepts_plex_user(self, username: Optional[str]) -> bool:
+    def accepts_plex_user(self, user_id: Optional[str], username: Optional[str]) -> bool:
         if self.mapping.plex_user is None:
-            return True
+            # 所有者映射读取的是所有者的观看状态，只认所有者（账户 id 1）的会话；取不到会话信息时放行
+            return user_id is None or user_id == "1"
         return username is not None and username.lower() == self.mapping.plex_user.lower()
 
 
@@ -88,10 +95,13 @@ class SyncEngine:
         self.queue: asyncio.Queue[tuple] = asyncio.Queue()
         # (server, item_id, pair_id) -> 截止时间；在此之前忽略该端该条目的事件（防回环）
         self._echo: dict[tuple[str, str, str], float] = {}
-        self._plex_sessions: dict[str, str] = {}
+        # sessionKey -> (Plex 账户 id, 用户名)
+        self._plex_sessions: dict[str, tuple[str, str]] = {}
         self._plex_last_enqueue: dict[tuple[str, str], float] = defaultdict(float)
-        # ratingKey -> 最近一次收到 playing 通知的时间
-        self._plex_playing: dict[str, float] = {}
+        # (pair_id, ratingKey) -> 该映射的 Plex 用户最近一次收到 playing 通知的时间
+        self._plex_playing: dict[tuple[str, str], float] = {}
+        # 队列中已有一个待执行的对账，不重复入队
+        self._reconcile_queued = False
         # pair_id -> 最近一次对账结果，供 Web 状态页展示
         self.reconcile_stats: dict[str, dict] = {}
         self.reconciling = False
@@ -99,8 +109,10 @@ class SyncEngine:
         self.trakt_next: dict[str, float] = {}
         self.last_poll: Optional[float] = None
         self.poll_error: Optional[str] = None
+        self.setup_error: Optional[str] = None
 
     async def setup(self) -> None:
+        self.pairs = []
         for m in self.cfg.mappings:
             user = await self.emby.resolve_user(m.emby_user)
             pair = Pair(m, m.plex_token or self.cfg.plex.token, user["id"], user["name"])
@@ -110,12 +122,26 @@ class SyncEngine:
                 self.trakt.add_account(m.trakt_user)
                 log.info("用户映射: Plex[%s] / Emby[%s] -> Trakt[%s]", m.plex_user or "所有者", user["name"], m.trakt_user)
 
+    async def _setup_until_ready(self) -> None:
+        """容器开机时 Emby 可能还没启动：初始化失败时退避重试，而不是让引擎退出"""
+        delay = SETUP_RETRY_MIN
+        while True:
+            try:
+                await self.setup()
+                self.setup_error = None
+                return
+            except Exception as e:
+                self.setup_error = f"初始化失败，{delay}s 后重试: {str(e) or e.__class__.__name__}"
+                log.warning("%s", self.setup_error)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, SETUP_RETRY_MAX)
+
     async def run(self) -> None:
-        await self.setup()
+        await self._setup_until_ready()
         now = time.time()
         for pair in self.pairs:
             pair.plex_since = pair.emby_since = now
-        self.queue.put_nowait(("reconcile",))
+        self.request_reconcile()
         tasks = [self._worker(), self._reconcile_timer(), self._poll_loop(), self.plex.listen(self.on_plex_playing)]
         if self.trakt and self.trakt.accounts:
             tasks.append(self.trakt.run())
@@ -140,17 +166,17 @@ class SyncEngine:
                 self._plex_sessions.update(await self.plex.session_users())
             except Exception as e:
                 log.debug("获取 Plex 会话失败: %s", e)
-        username = self._plex_sessions.get(session_key)
-        if state == "playing":
-            self._plex_playing[rating_key] = time.monotonic()
-        else:
-            self._plex_playing.pop(rating_key, None)
+        user_id, username = self._plex_sessions.get(session_key, (None, None))
 
         for pair in self.pairs:
-            if not pair.accepts_plex_user(username):
+            if not pair.accepts_plex_user(user_id, username):
                 continue
             k = (pair.id, rating_key)
             now = time.monotonic()
+            if state == "playing":
+                self._plex_playing[k] = now
+            else:
+                self._plex_playing.pop(k, None)
             if state in ("paused", "stopped"):
                 # 等 Plex 落盘进度后再读取
                 self._plex_last_enqueue[k] = now
@@ -239,19 +265,44 @@ class SyncEngine:
     async def _poll_resume(self, pair: Pair) -> None:
         plex_now = await self._resume_groups("plex", pair)
         emby_now = await self._resume_groups("emby", pair)
-        for src, prev, cur in (("plex", pair.plex_resume, plex_now), ("emby", pair.emby_resume, emby_now)):
-            if prev is None:
-                continue  # 首轮只建立基线
-            for group in prev.keys() - cur.keys():
-                self.queue.put_nowait(("resume_removed", pair, src, group, prev[group]))
-        pair.plex_resume, pair.emby_resume = plex_now, emby_now
+        for src, cur in (("plex", plex_now), ("emby", emby_now)):
+            prev = pair.plex_resume if src == "plex" else pair.emby_resume
+            if prev is not None:  # 首轮只建立基线
+                gone = {g: prev[g] for g in prev.keys() - cur.keys()}
+                if len(gone) >= RESUME_BULK_MIN and len(gone) * 2 > len(prev):
+                    # 多半是服务器重启或媒体库暂不可用时返回了不完整的列表：保留上一轮快照，本轮不处理
+                    log.warning(
+                        "[%s] %s 的继续观看一次少了 %d/%d 项，疑似服务器异常，本轮忽略（批量移除请使用手动同步继续观看）",
+                        pair.id, src, len(gone), len(prev),
+                    )
+                    pair.resume_gone[src] = {}
+                    continue
+                # 连续两轮都不在列表中才确认移除，避免列表短暂抖动造成误删
+                for group, ids in pair.resume_gone[src].items():
+                    if group not in cur:
+                        self.queue.put_nowait(("resume_removed", pair, src, group, ids))
+                pair.resume_gone[src] = gone
+            if src == "plex":
+                pair.plex_resume = cur
+            else:
+                pair.emby_resume = cur
+
+    @staticmethod
+    def _forget_resume(pair: Pair, server: str, group: str) -> None:
+        """我们自己造成的移除：从快照中去掉，避免下一轮反向再同步一次"""
+        snapshot = pair.plex_resume if server == "plex" else pair.emby_resume
+        if snapshot is not None:
+            snapshot.pop(group, None)
+        pair.resume_gone[server].pop(group, None)
 
     async def _handle_resume_removed(self, pair: Pair, src: str, group: str, item_ids: list[str]) -> None:
         title = group
         for item_id in item_ids:
             item = await self._get_item(src, pair, item_id)
             if item is None:
-                continue
+                # 读取失败或条目已删除（如洗版后换了 id），无法确认是用户手动移除
+                log.info("[%s] %s 离开 %s 的继续观看，但无法读取条目 %s，跳过", pair.id, group, src, item_id)
+                return
             title = item.title or title
             if item.state.played:
                 log.debug("[%s] %s 因看完离开继续观看，忽略", pair.id, title)
@@ -270,10 +321,7 @@ class SyncEngine:
                 await self.plex.remove_from_continue_watching(item_id, pair.plex_token)
             else:
                 await self.emby.hide_from_resume(pair.emby_user_id, item_id)
-        # 这是我们自己造成的移除，从快照中去掉，避免下一轮反向再同步一次
-        snapshot = pair.plex_resume if dst == "plex" else pair.emby_resume
-        if snapshot is not None:
-            snapshot.pop(group, None)
+        self._forget_resume(pair, dst, group)
 
     # ---------- 手动同步继续观看列表（一次性任务） ----------
     # 以整部电影/剧为单位，让目标端的继续观看尽量与源端一致：
@@ -349,10 +397,7 @@ class SyncEngine:
                     else:
                         await self.emby.hide_from_resume(pair.emby_user_id, item_id)
                 done["removed"] += 1
-                # 自己造成的移除，避免下一轮轮询再反向同步
-                snapshot = pair.plex_resume if dst == "plex" else pair.emby_resume
-                if snapshot is not None:
-                    snapshot.pop(r["group"], None)
+                self._forget_resume(pair, dst, r["group"])
             except Exception as e:
                 errors.append(f"移除 {r['title']} 失败: {e}")
 
@@ -383,6 +428,7 @@ class SyncEngine:
             job = await self.queue.get()
             try:
                 if job[0] == "reconcile":
+                    self._reconcile_queued = False
                     await self.reconcile_all()
                 elif job[0] == "resume_removed":
                     await self._handle_resume_removed(*job[1:])
@@ -403,11 +449,19 @@ class SyncEngine:
     async def _reconcile_timer(self) -> None:
         while True:
             await asyncio.sleep(self.cfg.sync.reconcile_interval)
-            self.queue.put_nowait(("reconcile",))
+            self.request_reconcile()
 
-    def _plex_playing_unstable(self, rating_key: str, state: WatchState) -> bool:
+    def request_reconcile(self) -> bool:
+        """对账入队；队列里已有待执行的对账时不重复入队（对账耗时超过间隔时避免越积越多）"""
+        if self._reconcile_queued:
+            return False
+        self._reconcile_queued = True
+        self.queue.put_nowait(("reconcile",))
+        return True
+
+    def _plex_playing_unstable(self, pair: Pair, rating_key: str, state: WatchState) -> bool:
         """Plex 客户端续播时会先上报 0 秒再跳到断点，这期间读到的进度不可信"""
-        seen = self._plex_playing.get(rating_key)
+        seen = self._plex_playing.get((pair.id, rating_key))
         if seen is None or time.monotonic() - seen > 60:
             return False
         return not state.played and state.position_ms < 30_000
@@ -424,15 +478,15 @@ class SyncEngine:
         src_item = await self._get_item(src, pair, item_id)
         if src_item is None:
             return
-        if src == "plex" and self._plex_playing_unstable(item_id, src_item.state):
+        if src == "plex" and self._plex_playing_unstable(pair, item_id, src_item.state):
             log.debug("[%s] %s 正在播放且进度接近 0，可能是续播前的瞬时状态，忽略", pair.id, src_item.title)
             return
-        playing = src == "plex" and item_id in self._plex_playing
+        playing = src == "plex" and (pair.id, item_id) in self._plex_playing
         # 一个文件包含多集时，对每一集分别同步
         for key in (src_item.key, *src_item.alt_keys):
             await self._sync_key(src, pair, replace(src_item, key=key, alt_keys=()))
             # Plex 正在播放时，Emby 侧的变化是我们同步过去的，不能当成“暂停”推给 Trakt
-            live = src == "plex" or not any(i in self._plex_playing for i in pair.plex_index.get(key, []))
+            live = src == "plex" or not any((pair.id, i) in self._plex_playing for i in pair.plex_index.get(key, []))
             self._observe(pair, key, src_item.state, src_item.title, src_item.duration_ms, playing, live)
 
     async def _sync_key(self, src: str, pair: Pair, src_item: MediaItem) -> None:
@@ -545,7 +599,8 @@ class SyncEngine:
     async def trakt_plan(self, pair: Pair, direction: str) -> tuple[dict, Any]:
         """基于最近一次对账的统一状态与 Trakt 当前数据生成同步计划，返回 (页面展示用, 执行用)。
         to_trakt：本地已看而 Trakt 没有的补观看记录；本地进度写入 Trakt；本地已看完的清除 Trakt 进度。
-        from_trakt：Trakt 已看而本地未看的标记已看；Trakt 进度更新且差距明显的写入本地。都不会改为未看。"""
+        from_trakt：Trakt 上新增（之前拉取时没见过）的观看记录、而本地未看的标记已看；
+        Trakt 进度更新且差距明显的写入本地。都不会改为未看。"""
         user = pair.mapping.trakt_user
         if not self.trakt or not user:
             raise ValueError("该映射未绑定 Trakt 账户")
@@ -579,9 +634,17 @@ class SyncEngine:
                 "clear": [entry(k, trakt_pct=playback[k].progress) for k in plan.clear],
             }
         elif direction == "from_trakt":
-            pull_watched = {
-                k: ts for k, ts in watched.items() if k in pair.unified and not pair.unified[k][0].played
-            }
+            # 之前拉取时已见过、且之后没有新观看的记录不再拉取：本地在那之后标记的未看（如准备重看）要保留
+            seen = self.store.trakt_seen(pair.id)
+            pull_watched: dict[MediaKey, int] = {}
+            kept_unwatched = 0
+            for k, ts in watched.items():
+                if k not in pair.unified or pair.unified[k][0].played:
+                    continue
+                if str(k) in seen and ts <= seen[str(k)]:
+                    kept_unwatched += 1
+                    continue
+                pull_watched[k] = ts
             pull_progress: dict[MediaKey, tuple[float, int]] = {}
             skipped = 0
             for key, pb in playback.items():
@@ -594,7 +657,7 @@ class SyncEngine:
                     skipped += 1  # 本地更新
                     continue
                 pull_progress[key] = (pb.progress, pb.paused_at)
-            plan = (pull_watched, pull_progress)
+            plan = (pull_watched, pull_progress, watched)
             show = {
                 "watched": [entry(k, watched_at=ts) for k, ts in pull_watched.items()],
                 "progress": [
@@ -602,6 +665,7 @@ class SyncEngine:
                     for k, (pct, _) in pull_progress.items()
                 ],
                 "skipped_newer": skipped,
+                "kept_unwatched": kept_unwatched,
             }
         else:
             raise ValueError(f"未知的同步方向: {direction}")
@@ -646,8 +710,13 @@ class SyncEngine:
                 log.warning("[%s] 定时%s失败: %s", pair.id, name, e)
 
     async def _trakt_pull(
-        self, pair: Pair, watched: dict[MediaKey, int], progress: dict[MediaKey, tuple[float, int]]
+        self,
+        pair: Pair,
+        watched: dict[MediaKey, int],
+        progress: dict[MediaKey, tuple[float, int]],
+        seen: Optional[dict[MediaKey, int]] = None,
     ) -> None:
+        """seen：生成计划时 Trakt 上的全部观看记录，执行后记为已见，之后只拉取新增的观看"""
         log.info(
             "[%s] 从 Trakt[%s] 全量同步开始：标记已看 %d 条，写入进度 %d 条%s",
             pair.id, pair.mapping.trakt_user, len(watched), len(progress), "（dry-run）" if self.cfg.sync.dry_run else "",
@@ -685,6 +754,8 @@ class SyncEngine:
                 # 写入后两端的回传事件不应再把同样的进度推回 Trakt
                 acc.progress_sent[key] = (pct, False)
             n_progress += 1
+        if seen and not self.cfg.sync.dry_run:
+            self.store.set_trakt_seen(pair.id, seen)
         log.info("[%s] 从 Trakt 全量同步完成：标记已看 %d 条，写入进度 %d 条", pair.id, n_watched, n_progress)
 
     # ---------- 服务器操作封装 ----------
@@ -762,11 +833,11 @@ class SyncEngine:
                         await self.plex.set_position(item.item_id, target.position_ms, pair.plex_token)
                 else:
                     if op == "played":
-                        await self.emby.mark_played(pair.emby_user_id, item.item_id)
+                        await self.emby.mark_played(pair.emby_user_id, item.item_id, target.last_played)
                     elif op == "unplayed":
                         await self.emby.mark_unplayed(pair.emby_user_id, item.item_id)
                     else:
-                        await self.emby.set_position(pair.emby_user_id, item.item_id, target.position_ms)
+                        await self.emby.set_position(pair.emby_user_id, item.item_id, target.position_ms, target.last_played)
         self._prune_echo()
 
     def _prune_echo(self) -> None:

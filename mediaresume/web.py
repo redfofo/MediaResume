@@ -121,7 +121,7 @@ class Runner:
         return {
             "configured": self.config_path.exists(),
             "running": running,
-            "error": self.error,
+            "error": self.error or (eng.setup_error if running and eng else None),
             "started_at": self.started_at if running else None,
             "dry_run": bool(self.cfg and self.cfg.sync.dry_run),
             "plex_ws": bool(running and eng and eng.plex.connected),
@@ -301,7 +301,7 @@ def create_app(runner: Runner, logs: LogBuffer, dist: Path) -> web.Application:
     async def reconcile(_: web.Request) -> web.Response:
         if not runner.engine or not runner.task or runner.task.done():
             return web.json_response({"ok": False, "error": "同步引擎未运行"}, status=409)
-        runner.engine.queue.put_nowait(("reconcile",))
+        runner.engine.request_reconcile()
         return web.json_response({"ok": True})
 
     def _resume_sync_args(body: dict) -> str:

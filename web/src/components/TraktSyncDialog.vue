@@ -121,6 +121,7 @@ async function execute() {
               {{ s.label }} {{ entries(p.plan, s.key).length }}
             </el-tag>
             <el-tag v-if="p.plan.skipped_newer" type="info">本地进度更新，跳过 {{ p.plan.skipped_newer }}</el-tag>
+            <el-tag v-if="p.plan.kept_unwatched" type="info">本地已标为未看，保留 {{ p.plan.kept_unwatched }}</el-tag>
           </div>
           <el-collapse>
             <template v-for="s in sections" :key="s.key">

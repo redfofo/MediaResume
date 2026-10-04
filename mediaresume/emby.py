@@ -40,6 +40,18 @@ def _item_tmdb(item: dict) -> Optional[str]:
     return tmdb_from_path(item.get("Path")) or _tmdb_of(item)
 
 
+def _emby_date(ts: int) -> str:
+    """unix 秒 -> Emby UserData 中的 UTC 日期；0 表示现在"""
+    dt = datetime.fromtimestamp(ts, timezone.utc) if ts else datetime.now(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
+
+
+def _emby_local_date(ts: int) -> str:
+    """PlayedItems 的 DatePlayed 参数：yyyyMMddHHmmss，按服务器本地时间解析"""
+    dt = datetime.fromtimestamp(ts) if ts else datetime.now()
+    return dt.strftime("%Y%m%d%H%M%S")
+
+
 FIELDS = "ProviderIds,Path"
 
 
@@ -225,15 +237,20 @@ class EmbyClient:
         await self._request("POST", f"/Users/{user_id}/Items/{item_id}/HideFromResume", params)
 
 
-    async def mark_played(self, user_id: str, item_id: str) -> None:
-        await self._request("POST", f"/Users/{user_id}/PlayedItems/{item_id}")
+    async def mark_played(self, user_id: str, item_id: str, played_at: int = 0) -> None:
+        # 带上播放时间，Emby 依据它推算继续观看中的“下一集”
+        params = {"DatePlayed": _emby_local_date(played_at)}
+        await self._request("POST", f"/Users/{user_id}/PlayedItems/{item_id}", params)
 
     async def mark_unplayed(self, user_id: str, item_id: str) -> None:
         await self._request("DELETE", f"/Users/{user_id}/PlayedItems/{item_id}")
 
-    async def set_position(self, user_id: str, item_id: str, position_ms: int) -> None:
+    async def set_position(self, user_id: str, item_id: str, position_ms: int, played_at: int = 0) -> None:
         # 带上完整 UserData，避免覆盖收藏等其他字段
         data = await self._request("GET", f"/Users/{user_id}/Items/{item_id}")
         user_data = dict((data or {}).get("UserData") or {})
         user_data["PlaybackPositionTicks"] = position_ms * TICKS_PER_MS
+        # 没有 LastPlayedDate 的条目不会出现在 Emby 的继续观看中；清除进度时保留原值，不冒充刚播放过
+        if position_ms > 0:
+            user_data["LastPlayedDate"] = _emby_date(played_at)
         await self._request("POST", f"/Users/{user_id}/Items/{item_id}/UserData", body=user_data)

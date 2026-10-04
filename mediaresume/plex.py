@@ -290,13 +290,13 @@ class PlexClient:
                 })
         return out
 
-    async def session_users(self) -> dict[str, str]:
-        """sessionKey -> 用户名"""
+    async def session_users(self) -> dict[str, tuple[str, str]]:
+        """sessionKey -> (账户 id, 用户名)；账户 id 为 "1" 的是服务器所有者"""
         data = await self._get("/status/sessions")
         out = {}
         for meta in data.get("MediaContainer", {}).get("Metadata") or []:
-            user = (meta.get("User") or {}).get("title", "")
-            out[str(meta.get("sessionKey"))] = user
+            user = meta.get("User") or {}
+            out[str(meta.get("sessionKey"))] = (str(user.get("id", "")), user.get("title", ""))
         return out
 
     # ---------- 写入 ----------
