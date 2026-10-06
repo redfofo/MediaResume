@@ -410,6 +410,14 @@ class TraktSync:
     def add_account(self, username: str) -> None:
         self.accounts.setdefault(username, TraktAccount(username))
 
+    def reauthorized(self, username: str) -> None:
+        """页面重新授权后恢复该账户的推送，无需重启引擎"""
+        acc = self.accounts.get(username)
+        if acc and acc.auth_failed:
+            acc.auth_failed, acc.error = False, None
+            acc.retry_at, acc.retry_delay = 0, RETRY_MIN
+            log.info("Trakt 账户 %s 已重新授权，恢复推送", username)
+
     def _account(self, username: Optional[str]) -> Optional[TraktAccount]:
         acc = self.accounts.get(username) if username else None
         return None if acc is None or acc.auth_failed else acc
@@ -500,9 +508,8 @@ class TraktSync:
     # ---------- 手动全量推送 ----------
 
     async def push_full(self, username: str, plan: PushPlan) -> None:
+        """调用方（引擎）负责检查并占用 busy，这里只在结束时释放"""
         acc = self.accounts[username]
-        if acc.busy:
-            raise RuntimeError(f"Trakt[{username}] 已有全量同步在执行")
         acc.busy = True
         try:
             if not await self._guard(acc, self._push_full(acc, plan)):

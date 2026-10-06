@@ -46,9 +46,10 @@ def _emby_date(ts: int) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S.0000000Z")
 
 
-def _emby_local_date(ts: int) -> str:
-    """PlayedItems 的 DatePlayed 参数：yyyyMMddHHmmss，按服务器本地时间解析"""
-    dt = datetime.fromtimestamp(ts) if ts else datetime.now()
+def _emby_played_date(ts: int) -> str:
+    """PlayedItems 的 DatePlayed 参数：yyyyMMddHHmmss，不带时区。
+    Emby 按 UTC 解析（ParseExact + AdjustToUniversal），因此按 UTC 格式化，不能用容器本地时区（TZ 可能被设成东八区）"""
+    dt = datetime.fromtimestamp(ts, timezone.utc) if ts else datetime.now(timezone.utc)
     return dt.strftime("%Y%m%d%H%M%S")
 
 
@@ -239,7 +240,7 @@ class EmbyClient:
 
     async def mark_played(self, user_id: str, item_id: str, played_at: int = 0) -> None:
         # 带上播放时间，Emby 依据它推算继续观看中的“下一集”
-        params = {"DatePlayed": _emby_local_date(played_at)}
+        params = {"DatePlayed": _emby_played_date(played_at)}
         await self._request("POST", f"/Users/{user_id}/PlayedItems/{item_id}", params)
 
     async def mark_unplayed(self, user_id: str, item_id: str) -> None:

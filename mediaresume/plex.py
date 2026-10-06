@@ -19,10 +19,22 @@ SLIM = {
     "excludeElements": "Media,Genre,Country,Director,Writer,Role,Guid,Image,UltraBlurColors,Rating,Collection,Label",
     "excludeFields": "summary,thumb,art,theme,file",
 }
-# 同上，但保留 Media（文件路径，用于取 {tmdb-} 标记）
-SLIM_KEEP_MEDIA = {**SLIM, "excludeElements": SLIM["excludeElements"].replace("Media,", "")}
+# 同上，但保留 Media（文件路径，用于取 {tmdb-} 标记）。
+# excludeFields 对 Part 同样生效，不能排除 file；顺带去掉 Media 上用不到的编码信息，全量对账的响应体可减少三到五成
+SLIM_KEEP_MEDIA = {
+    "excludeElements": SLIM["excludeElements"].replace("Media,", ""),
+    "excludeFields": (
+        "summary,thumb,art,theme,parentThumb,grandparentThumb,grandparentArt,parentTheme,grandparentTheme,"
+        "tagline,contentRating,studio,originallyAvailableAt,addedAt,updatedAt,audienceRating,rating,chapterSource,"
+        "bitrate,width,height,aspectRatio,audioChannels,audioCodec,videoCodec,videoResolution,container,"
+        "videoFrameRate,videoProfile,audioProfile,size,hasThumbnail,optimizedForStreaming,has64bitOffsets,"
+        "hasVoiceActivity,editionTitle"
+    ),
+}
 # 保留 Media 和 Guid
 SLIM_WITH_GUID = {**SLIM_KEEP_MEDIA, "includeGuids": 1, "excludeElements": SLIM_KEEP_MEDIA["excludeElements"].replace("Guid,", "")}
+# 剧集本身（不含单集）：只需 Guid
+SLIM_SHOW = {**SLIM, "includeGuids": 1, "excludeElements": SLIM["excludeElements"].replace("Guid,", "")}
 # 定向查找时刷新剧集/电影目录的最小间隔（秒）
 CATALOG_REFRESH_INTERVAL = 60
 
@@ -130,13 +142,13 @@ class PlexClient:
             show_tmdb = await self._show_tmdb_id(str(meta.get("grandparentRatingKey")))
         return self._to_item(meta, show_tmdb)
 
-    async def _list_section(self, section: str, type_id: int, token: Optional[str]) -> list[dict]:
+    async def _list_section(self, section: str, type_id: int, token: Optional[str], slim: dict) -> list[dict]:
         out: list[dict] = []
         start = 0
         while True:
             params = {
+                **slim,
                 "type": type_id,
-                "includeGuids": 1,
                 "X-Plex-Container-Start": start,
                 "X-Plex-Container-Size": PAGE_SIZE,
             }
@@ -155,14 +167,14 @@ class PlexClient:
         for sec in sections:
             sid = str(sec["key"])
             if sec.get("type") == "movie":
-                for meta in await self._list_section(sid, 1, token):
+                for meta in await self._list_section(sid, 1, token, SLIM_WITH_GUID):
                     if item := self._to_item(meta):
                         self._movie_tmdb[item.item_id] = item.key.tmdb
                         items.append(item)
             elif sec.get("type") == "show":
-                for show in await self._list_section(sid, 2, token):
+                for show in await self._list_section(sid, 2, token, SLIM_SHOW):
                     self._show_tmdb[str(show["ratingKey"])] = self._tmdb_of(show)
-                for meta in await self._list_section(sid, 4, token):
+                for meta in await self._list_section(sid, 4, token, SLIM_KEEP_MEDIA):
                     show_rk = str(meta.get("grandparentRatingKey"))
                     # 单集文件路径上的标记比剧的元数据更可靠，顺便更新剧的缓存
                     if tmdb := self._path_tmdb(meta):

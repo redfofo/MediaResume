@@ -194,3 +194,22 @@ def test_resume_sync_fails_future_when_engine_stops():
         return fut.exception()
 
     assert isinstance(run(main()), RuntimeError)
+
+
+def test_agreed_uses_earliest_watch_time():
+    from mediaresume.engine import _agreed
+
+    assert _agreed(WatchState(True, 0, 200), WatchState(True, 0, 100)).last_played == 100
+    assert _agreed(WatchState(True, 0, 200), WatchState(True, 0, 0)).last_played == 200
+    assert _agreed(WatchState(False, 5, 200), WatchState(False, 5, 100)).last_played == 200
+
+
+def test_store_bulk_read_and_batched_commit(tmp_path):
+    from mediaresume.store import StateStore
+
+    path = str(tmp_path / "s.db")
+    store = StateStore(path)
+    store.set("p", MOVIE, WatchState(False, 1000, 5), commit=False)
+    assert StateStore(path).all("p") == {}  # 未提交，其他连接看不到
+    store.commit()
+    assert StateStore(path).all("p") == {str(MOVIE): WatchState(False, 1000, 5)}

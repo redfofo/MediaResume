@@ -173,8 +173,9 @@ export interface ResumePairBase {
 async function request<T>(method: string, url: string, body?: unknown): Promise<T> {
   const resp = await fetch(url, {
     method,
-    headers: body ? { 'Content-Type': 'application/json' } : undefined,
-    body: body ? JSON.stringify(body) : undefined,
+    // 写接口一律以 JSON 发送（服务端据此拦截跨站请求）
+    headers: method === 'GET' ? undefined : { 'Content-Type': 'application/json' },
+    body: method === 'GET' ? undefined : JSON.stringify(body ?? {}),
   })
   const data = await resp.json().catch(() => ({}))
   if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`)

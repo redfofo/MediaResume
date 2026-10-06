@@ -384,8 +384,9 @@ docker logs -f mediaresume
 ## 安全建议
 
 - 建议始终设置 `MEDIARESUME_PASSWORD`。
+- 可选：设置 `MEDIARESUME_ALLOWED_HOSTS` 为你访问管理页面时使用的主机名（逗号分隔、不含端口），例如 `192.168.1.5,nas.lan`，其他主机名的请求一律拒绝，可防御 DNS rebinding 攻击。经反向代理访问时，填写代理转发给本服务的 Host。
 - 不要把 8095 端口直接暴露到公网；需要远程使用时，通过带 HTTPS 和身份认证的反向代理访问。
-- `config.yaml` 以明文保存 Plex Token、Emby API Key 和 Trakt Client Secret，`data/trakt_tokens.json` 保存 Trakt 授权信息，请限制挂载目录的访问权限并妥善备份。
+- `config.yaml` 以明文保存 Plex Token、Emby API Key 和 Trakt Client Secret，`data/trakt_tokens.json` 保存 Trakt 授权信息，两者都只允许属主读写（0600），请限制挂载目录的访问权限并妥善备份。
 - 不要把 `config/`、`.env` 或数据库文件提交到 Git。仓库提供的 `.gitignore` 已默认排除这些文件。
 
 ## 开源许可证

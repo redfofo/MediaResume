@@ -24,6 +24,10 @@ RESUME_BULK_MIN = 3
 SETUP_RETRY_MIN, SETUP_RETRY_MAX = 10, 300
 # 播放中 Plex 约每 10 秒推送一次 playing 通知；超过此时间（秒）没收到，视为已不在播放（可能漏了 stopped）
 PLAYING_STALE = 120
+# 增量轮询的水位往回多取这么多秒，容忍本机与 Plex / Emby 服务器的时钟偏差（重复处理是幂等的）
+POLL_OVERLAP = 30
+# 对账时每写入这么多条基准提交一次
+COMMIT_EVERY = 500
 
 
 def decide(plex: WatchState, emby: WatchState, base: Optional[WatchState]) -> Optional[WatchState]:
@@ -156,7 +160,10 @@ class SyncEngine:
                 if hours > 0:
                     tasks.append(self._trakt_timer(direction, hours * 3600))
         try:
-            await asyncio.gather(*tasks)
+            # 任一循环意外退出时取消其余循环，整体报错，而不是留下半运行的引擎
+            async with asyncio.TaskGroup() as tg:
+                for coro in tasks:
+                    tg.create_task(coro)
         finally:
             # 引擎重启时一并停止进行中的 Trakt 全量推送
             for task in self._background:
@@ -229,11 +236,10 @@ class SyncEngine:
 
     async def _poll(self, pair: Pair) -> None:
         now = time.time()
-        # 留 5 秒余量，重复入队无害（处理是幂等的）
-        for item_id in await self.emby.changed_since(pair.emby_user_id, pair.emby_since - 5):
+        for item_id in await self.emby.changed_since(pair.emby_user_id, pair.emby_since - POLL_OVERLAP):
             self.queue.put_nowait(("emby", pair, item_id))
         pair.emby_since = now
-        for rk, show_rk in await self.plex.recently_viewed(int(pair.plex_since) - 5, pair.plex_token):
+        for rk, show_rk in await self.plex.recently_viewed(int(pair.plex_since) - POLL_OVERLAP, pair.plex_token):
             self.queue.put_nowait(("plex", pair, rk))
             if show_rk:
                 pair.plex_active_shows.add(show_rk)
@@ -567,26 +573,39 @@ class SyncEngine:
         for key in plex_groups.keys() ^ emby_groups.keys():
             items = plex_groups.get(key) or emby_groups[key]
             self._observe(pair, key, merge_states(items), items[0].title, _duration(items))
-        for key in plex_groups.keys() & emby_groups.keys():
-            p_items, e_items = plex_groups[key], emby_groups[key]
-            p, e = merge_states(p_items), merge_states(e_items)
-            base = self.store.get(pair.id, key)
-            target = decide(p, e, base)
-            self._observe(pair, key, target or p, p_items[0].title, _duration(p_items + e_items))
-            if target is None:
-                if not p.same_as(base):
-                    self.store.set(pair.id, key, p)
-                continue
-            title = p_items[0].title or str(key)
-            if not target.same_as(p):
-                log.info("[%s] 对账 emby → plex: %s %s", pair.id, title, _fmt(target))
-                await self._apply("plex", pair, p_items, target)
-            if not target.same_as(e):
-                log.info("[%s] 对账 plex → emby: %s %s", pair.id, title, _fmt(target))
-                await self._apply("emby", pair, e_items, target)
-            if not self.cfg.sync.dry_run:
-                self.store.set(pair.id, key, target)
-            changed += 1
+        # 已从两端媒体库删除的条目不再参与 Trakt 全量同步
+        for key in pair.unified.keys() - plex_groups.keys() - emby_groups.keys():
+            del pair.unified[key]
+        bases = self.store.all(pair.id)
+        pending = 0
+        try:
+            for key in plex_groups.keys() & emby_groups.keys():
+                p_items, e_items = plex_groups[key], emby_groups[key]
+                p, e = merge_states(p_items), merge_states(e_items)
+                base = bases.get(str(key))
+                target = decide(p, e, base)
+                self._observe(pair, key, target or _agreed(p, e), p_items[0].title, _duration(p_items + e_items))
+                if target is None:
+                    if not p.same_as(base):
+                        self.store.set(pair.id, key, p, commit=False)
+                        pending += 1
+                else:
+                    title = p_items[0].title or str(key)
+                    if not target.same_as(p):
+                        log.info("[%s] 对账 emby → plex: %s %s", pair.id, title, _fmt(target))
+                        await self._apply("plex", pair, p_items, target)
+                    if not target.same_as(e):
+                        log.info("[%s] 对账 plex → emby: %s %s", pair.id, title, _fmt(target))
+                        await self._apply("emby", pair, e_items, target)
+                    if not self.cfg.sync.dry_run:
+                        self.store.set(pair.id, key, target, commit=False)
+                        pending += 1
+                    changed += 1
+                if pending >= COMMIT_EVERY:
+                    self.store.commit()
+                    pending = 0
+        finally:
+            self.store.commit()
         stats = {
             "at": time.time(),
             "plex": len(plex_groups),
@@ -709,9 +728,18 @@ class SyncEngine:
     async def trakt_execute(self, pair: Pair, direction: str) -> dict:
         """推送在后台任务中执行（只写 Trakt，不占用 worker）；拉回交给 worker 串行写入 Plex / Emby"""
         user = pair.mapping.trakt_user
-        if self.trakt and user and self.trakt.accounts[user].busy:
+        acc = self.trakt.accounts.get(user) if self.trakt and user else None
+        if acc and acc.busy:
             raise ValueError(f"Trakt[{user}] 已有全量同步在执行")
-        show, plan = await self.trakt_plan(pair, direction)
+        if direction == "to_trakt" and acc:
+            # 生成计划需要请求 Trakt：先占住，避免两个请求同时通过上面的检查
+            acc.busy = True
+        try:
+            show, plan = await self.trakt_plan(pair, direction)
+        except BaseException:
+            if direction == "to_trakt" and acc:
+                acc.busy = False
+            raise
         if direction == "to_trakt":
             task = asyncio.create_task(self.trakt.push_full(user, plan))
             self._background.add(task)
@@ -881,6 +909,15 @@ class SyncEngine:
 def _progress_differs(state: WatchState, duration_ms: int, pct: float) -> bool:
     """本地进度与 Trakt 百分比的差距超过容差（Trakt 只有百分比，至少按 2% 片长计）"""
     return abs(int(duration_ms * pct / 100) - state.position_ms) >= max(POSITION_TOLERANCE_MS, duration_ms // 50)
+
+
+def _agreed(p: WatchState, e: WatchState) -> WatchState:
+    """两端一致时的统一状态。都已看时取较早的观看时间：
+    同步写入的一端（如 Plex 标记已看）记录的是同步时间，较早的才是真实观看时间"""
+    if not (p.played and e.played):
+        return p
+    times = [t for t in (p.last_played, e.last_played) if t > 0]
+    return replace(p, last_played=min(times, default=0))
 
 
 def _duration(items: list[MediaItem]) -> int:

@@ -14,6 +14,9 @@ class StateStore:
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
+        # WAL + NORMAL：每次提交不必等待完整 fsync，在 NAS 机械盘上写入快很多，断电最多丢最后几次提交
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute(
             """
             CREATE TABLE IF NOT EXISTS sync_state (
@@ -49,7 +52,13 @@ class StateStore:
             return None
         return WatchState(played=bool(row[0]), position_ms=row[1], last_played=row[2])
 
-    def set(self, pair: str, key: MediaKey, state: WatchState) -> None:
+    def all(self, pair: str) -> dict[str, WatchState]:
+        """该用户对的全部基准，对账时一次读出，不必逐条查询"""
+        rows = self.conn.execute("SELECT media_key, played, position_ms, last_played FROM sync_state WHERE pair=?", (pair,))
+        return {k: WatchState(played=bool(p), position_ms=pos, last_played=last) for k, p, pos, last in rows}
+
+    def set(self, pair: str, key: MediaKey, state: WatchState, commit: bool = True) -> None:
+        """commit=False 时由调用方批量提交（见 commit）"""
         self.conn.execute(
             """
             INSERT INTO sync_state (pair, media_key, played, position_ms, last_played, updated_at)
@@ -60,6 +69,10 @@ class StateStore:
             """,
             (pair, str(key), int(state.played), state.position_ms, state.last_played, int(time.time())),
         )
+        if commit:
+            self.conn.commit()
+
+    def commit(self) -> None:
         self.conn.commit()
 
     def trakt_seen(self, pair: str) -> dict[str, int]:

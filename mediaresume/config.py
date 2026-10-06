@@ -164,4 +164,6 @@ def save_config(cfg: Config, path: str | Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(yaml.safe_dump(config_to_dict(cfg), allow_unicode=True, sort_keys=False), encoding="utf-8")
+    # 含 Plex Token / Emby API Key，只允许属主读写
+    os.chmod(tmp, 0o600)
     os.replace(tmp, path)

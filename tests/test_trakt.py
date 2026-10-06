@@ -491,3 +491,48 @@ def test_config_trakt_schedule():
         with pytest.raises(ValueError):
             parse_config({**BASE, "mappings": [{"emby_user": "u"}], "trakt": {"push_interval": bad}})
 
+
+
+def test_reconcile_drops_deleted_items_from_unified(tmp_path):
+    eng, pair, plex, *_ = make_engine(tmp_path, [MediaItem("plex", "1", MOVIE, played())], [])
+    pair.unified[EP4] = (played(), "gone", 0)
+    run(eng._reconcile(pair))
+    assert set(pair.unified) == {MOVIE}
+
+
+def test_reconcile_reports_earliest_watch_time(tmp_path):
+    eng, pair, *_ = make_engine(
+        tmp_path,
+        [MediaItem("plex", "1", MOVIE, WatchState(True, 0, NOW))],  # 同步写入时 Plex 记录的是同步时间
+        [MediaItem("emby", "a", MOVIE, WatchState(True, 0, NOW - 3600))],
+    )
+    run(eng._reconcile(pair))
+    assert pair.unified[MOVIE][0].last_played == NOW - 3600
+
+
+def test_concurrent_push_requests_run_once(tmp_path):
+    client = FakeClient()
+    eng, pair, *_ = make_engine(tmp_path, [MediaItem("plex", "1", MOVIE, played(), "M")], [], client=client)
+    run(eng._reconcile(pair))
+
+    async def main():
+        results = await asyncio.gather(
+            eng.trakt_execute(pair, "to_trakt"), eng.trakt_execute(pair, "to_trakt"), return_exceptions=True
+        )
+        await asyncio.gather(*eng._background)
+        return results
+
+    results = run(main())
+    assert sum(isinstance(r, ValueError) for r in results) == 1
+    assert len(client.posts) == 1
+
+
+def test_reauthorize_resumes_account(tmp_path):
+    sync, acc = make(FakeClient(fail=TraktAuthError("请重新授权")), tmp_path)
+    sync.observe_live("me", MOVIE, *progress(30))
+    run(sync._guard(acc, sync._push_live(acc)))
+    assert acc.auth_failed
+    sync.reauthorized("me")
+    assert not acc.auth_failed and acc.error is None
+    sync.observe_live("me", EP1, *progress(30))
+    assert EP1 in acc.pending

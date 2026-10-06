@@ -75,3 +75,50 @@ def test_concurrent_restarts_leave_one_engine(tmp_path, monkeypatch):
         return alive
 
     assert len(asyncio.run(main())) == 1
+
+
+def test_saved_config_is_private(tmp_path):
+    import os
+
+    from mediaresume.config import save_config
+
+    path = tmp_path / "config.yaml"
+    save_config(parse_config(base()), path)
+    assert os.stat(path).st_mode & 0o777 == 0o600
+
+
+def make_app(tmp_path, monkeypatch, **env):
+    from mediaresume.web import LogBuffer, create_app
+
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    runner = Runner(None, tmp_path / "config.yaml")
+    return create_app(runner, LogBuffer(), tmp_path / "no-dist")
+
+
+def test_write_api_requires_json(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def main():
+        async with TestClient(TestServer(make_app(tmp_path, monkeypatch))) as client:
+            forged = await client.post("/api/reconcile", data="{}", headers={"Content-Type": "text/plain"})
+            ok = await client.post("/api/reconcile", json={})
+            read = await client.get("/api/status")
+            return forged.status, ok.status, read.status
+
+    # 引擎未运行时对账返回 409：说明请求已通过中间件
+    assert asyncio.run(main()) == (415, 409, 200)
+
+
+def test_allowed_hosts(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def main():
+        app = make_app(tmp_path, monkeypatch, MEDIARESUME_ALLOWED_HOSTS="127.0.0.1, NAS.lan")
+        async with TestClient(TestServer(app, host="127.0.0.1")) as client:
+            ok = await client.get("/api/status")
+            evil = await client.get("/api/status", headers={"Host": "evil.example:8095"})
+            lan = await client.get("/api/status", headers={"Host": "nas.lan:8095"})
+            return ok.status, evil.status, lan.status
+
+    assert asyncio.run(main()) == (200, 421, 200)

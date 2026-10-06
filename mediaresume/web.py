@@ -178,9 +178,37 @@ def _basic_auth_middleware(password: str):
     return middleware
 
 
+@web.middleware
+async def _csrf_middleware(request: web.Request, handler):
+    """写接口只接受 JSON 请求。跨站页面只能发出 text/plain / 表单这类“简单请求”（浏览器会带上缓存的登录凭据），
+    要发 application/json 必须先通过 CORS 预检，而本服务不返回 CORS 头，因此跨站请求会被拦下"""
+    if request.method not in ("GET", "HEAD", "OPTIONS") and request.path.startswith("/api/"):
+        if request.content_type != "application/json":
+            return web.json_response({"error": "请求的 Content-Type 必须是 application/json"}, status=415)
+    return await handler(request)
+
+
+def _allowed_hosts_middleware(hosts: set[str]):
+    """只响应这些主机名的请求，防御 DNS rebinding（恶意域名解析到本服务后，以同源身份读取配置）"""
+
+    @web.middleware
+    async def middleware(request: web.Request, handler):
+        if (request.url.host or "").lower() not in hosts:
+            return web.Response(status=421, text="Host not allowed")
+        return await handler(request)
+
+    return middleware
+
+
 def create_app(runner: Runner, logs: LogBuffer, dist: Path) -> web.Application:
     password = os.environ.get("MEDIARESUME_PASSWORD")
-    app = web.Application(middlewares=[_basic_auth_middleware(password)] if password else [])
+    middlewares = [_csrf_middleware]
+    if password:
+        middlewares.insert(0, _basic_auth_middleware(password))
+    # 逗号分隔的主机名（不含端口），如 192.168.1.5,nas.lan；未设置时不限制
+    if allowed := os.environ.get("MEDIARESUME_ALLOWED_HOSTS", "").strip():
+        middlewares.insert(0, _allowed_hosts_middleware({h.strip().lower() for h in allowed.split(",") if h.strip()}))
+    app = web.Application(middlewares=middlewares)
     routes = web.RouteTableDef()
 
     @routes.get("/api/config")
@@ -260,6 +288,8 @@ def create_app(runner: Runner, logs: LogBuffer, dist: Path) -> web.Application:
                 username = await client.username_of(data["access_token"])
                 runner.trakt_tokens.set(username, token_record(data, client.cfg.client_id))
                 log.info("Trakt 账户 %s 授权成功", username)
+                if runner.engine and runner.engine.trakt:
+                    runner.engine.trakt.reauthorized(username)
                 return web.json_response({"status": "ok", "username": username})
         except Exception as e:
             return web.json_response({"status": "error", "error": _err(e)})
