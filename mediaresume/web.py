@@ -62,8 +62,23 @@ class Runner:
         self.started_at: Optional[float] = None
         # 与配置文件放在同一挂载目录下
         self.trakt_tokens = TraktTokenStore(config_path.parent / "data" / "trakt_tokens.json")
+        # 启动 / 停止 / 重启串行执行，避免并发保存配置时启动两个引擎
+        self._lock = asyncio.Lock()
 
     async def start(self) -> None:
+        async with self._lock:
+            await self._start()
+
+    async def stop(self) -> None:
+        async with self._lock:
+            await self._stop()
+
+    async def restart(self) -> None:
+        async with self._lock:
+            await self._stop()
+            await self._start()
+
+    async def _start(self) -> None:
         self.error = None
         if not self.config_path.exists():
             log.info("配置文件 %s 不存在，请在 Web 页面中完成配置", self.config_path)
@@ -74,19 +89,26 @@ class Runner:
             self.error = f"配置无效: {e}"
             log.error(self.error)
             return
-        logging.getLogger().setLevel(self.cfg.log_level.upper())
-        self.store = StateStore(self.cfg.db_path)
-        trakt = None
-        if any(m.trakt_user for m in self.cfg.mappings):
-            client = TraktClient(self.http, self.cfg.trakt, self.trakt_tokens)
-            trakt = TraktSync(client, self.cfg.trakt, self.cfg.sync.dry_run)
-        self.engine = SyncEngine(
-            self.cfg,
-            PlexClient(self.http, self.cfg.plex.url, self.cfg.plex.token),
-            EmbyClient(self.http, self.cfg.emby.url, self.cfg.emby.api_key),
-            self.store,
-            trakt,
-        )
+        # 初始化失败只记录错误，不能让进程退出：否则容器反复重启，也无法进入页面修改配置
+        try:
+            logging.getLogger().setLevel(self.cfg.log_level)
+            self.store = StateStore(self.cfg.db_path)
+            trakt = None
+            if any(m.trakt_user for m in self.cfg.mappings):
+                client = TraktClient(self.http, self.cfg.trakt, self.trakt_tokens)
+                trakt = TraktSync(client, self.cfg.trakt, self.cfg.sync.dry_run)
+            self.engine = SyncEngine(
+                self.cfg,
+                PlexClient(self.http, self.cfg.plex.url, self.cfg.plex.token),
+                EmbyClient(self.http, self.cfg.emby.url, self.cfg.emby.api_key),
+                self.store,
+                trakt,
+            )
+        except Exception as e:
+            self.error = f"同步引擎初始化失败: {e}"
+            log.exception(self.error)
+            await self._stop()
+            return
         self.started_at = time.time()
         self.task = asyncio.create_task(self.engine.run())
         self.task.add_done_callback(self._on_done)
@@ -98,7 +120,7 @@ class Runner:
             self.error = f"同步引擎异常退出: {exc}"
             log.error(self.error, exc_info=exc)
 
-    async def stop(self) -> None:
+    async def _stop(self) -> None:
         if self.task and not self.task.done():
             self.task.cancel()
             try:
@@ -110,10 +132,6 @@ class Runner:
         if self.store:
             self.store.close()
             self.store = None
-
-    async def restart(self) -> None:
-        await self.stop()
-        await self.start()
 
     def status(self) -> dict:
         running = self.task is not None and not self.task.done()

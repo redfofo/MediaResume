@@ -141,3 +141,56 @@ def test_setup_retries_until_emby_ready(monkeypatch):
     monkeypatch.setattr("mediaresume.engine.asyncio.sleep", no_sleep)
     run(eng._setup_until_ready())
     assert Emby.calls == 3 and len(eng.pairs) == 1 and eng.setup_error is None
+
+
+def test_stale_playing_expires_and_reconnect_clears(monkeypatch):
+    eng, pair = make_engine()
+    eng._plex_playing[(pair.id, "1")] = time.monotonic()
+    assert eng._is_playing(pair, "1")
+    eng._plex_playing[(pair.id, "1")] = time.monotonic() - 500  # 漏了 stopped
+    assert not eng._is_playing(pair, "1")
+    assert (pair.id, "1") not in eng._plex_playing
+    eng._plex_playing[(pair.id, "2")] = time.monotonic()
+    eng._plex_sessions["10"] = ("1", "owner")
+    eng._on_plex_connect()
+    assert eng._plex_playing == {} and eng._plex_sessions == {}
+
+
+def test_resume_sync_result_after_request_timeout():
+    eng, pair = make_engine()
+
+    async def fake_sync(*_):
+        return {"ok": True}
+
+    eng._resume_sync = fake_sync
+
+    async def main():
+        fut = asyncio.get_running_loop().create_future()
+        fut.cancel()  # 页面请求已超时
+        await eng._run_resume_sync(pair, "plex", fut)  # 不应抛 InvalidStateError
+        fut = asyncio.get_running_loop().create_future()
+        await eng._run_resume_sync(pair, "plex", fut)
+        return fut.result()
+
+    assert run(main()) == {"ok": True}
+
+
+def test_resume_sync_fails_future_when_engine_stops():
+    eng, pair = make_engine()
+
+    async def main():
+        started = asyncio.Event()
+
+        async def slow_sync(*_):
+            started.set()
+            await asyncio.sleep(10)
+
+        eng._resume_sync = slow_sync
+        fut = asyncio.get_running_loop().create_future()
+        task = asyncio.create_task(eng._run_resume_sync(pair, "plex", fut))
+        await started.wait()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        return fut.exception()
+
+    assert isinstance(run(main()), RuntimeError)

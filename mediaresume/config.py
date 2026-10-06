@@ -71,6 +71,32 @@ class Config:
     log_level: str = "INFO"
 
 
+# 同步参数的取值下限（与 Web 页面一致）：过小会让轮询 / 对账空转，拖垮 Plex、Emby
+SYNC_MIN = {"reconcile_interval": 60, "poll_interval": 5, "unwatch_poll_interval": 30, "progress_interval": 10, "echo_window": 1}
+LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+
+
+def _as_int(value: Any, name: str, minimum: int) -> int:
+    # bool 是 int 的子类，yaml 里写成 true/false 时也要拒绝
+    if isinstance(value, bool):
+        raise ValueError(f"{name} 必须是整数")
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} 必须是整数") from None
+    if n < minimum:
+        raise ValueError(f"{name} 不能小于 {minimum}")
+    return n
+
+
+def _as_bool(value: Any, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in ("true", "false"):
+        return value.strip().lower() == "true"
+    raise ValueError(f"{name} 必须是 true 或 false")
+
+
 def parse_config(raw: dict[str, Any]) -> Config:
     """从 dict 构造并校验配置，校验失败抛出 ValueError"""
     try:
@@ -100,24 +126,28 @@ def parse_config(raw: dict[str, Any]) -> Config:
         **{k: v for k, v in trakt_raw.items() if k in TraktConfig.__dataclass_fields__ and v is not None},
     )
     trakt.client_id, trakt.client_secret = str(trakt.client_id).strip(), str(trakt.client_secret).strip()
-    try:
-        trakt.push_interval, trakt.pull_interval = int(trakt.push_interval), int(trakt.pull_interval)
-    except (TypeError, ValueError):
-        raise ValueError("Trakt 定时全量同步间隔必须是整数（小时）") from None
-    if trakt.push_interval < 0 or trakt.pull_interval < 0:
-        raise ValueError("Trakt 定时全量同步间隔不能为负数")
+    trakt.push_interval = _as_int(trakt.push_interval, "Trakt 定时全量同步间隔（小时）", 0)
+    trakt.pull_interval = _as_int(trakt.pull_interval, "Trakt 定时全量同步间隔（小时）", 0)
+    trakt.scrobble = _as_bool(trakt.scrobble, "trakt.scrobble")
     if any(m.trakt_user for m in mappings) and not trakt.client_id:
         raise ValueError("用户映射绑定了 Trakt 账户，需要填写 Trakt Client ID")
     sync_raw = raw.get("sync") or {}
-    sync = SyncConfig(**{k: v for k, v in sync_raw.items() if k in SyncConfig.__dataclass_fields__})
+    sync = SyncConfig(**{k: v for k, v in sync_raw.items() if k in SyncConfig.__dataclass_fields__ and v is not None})
+    for name, minimum in SYNC_MIN.items():
+        setattr(sync, name, _as_int(getattr(sync, name), f"sync.{name}", minimum))
+    sync.dry_run = _as_bool(sync.dry_run, "sync.dry_run")
+    log_level = str(raw.get("log_level") or "INFO").strip().upper()
+    if log_level not in LOG_LEVELS:
+        raise ValueError(f"log_level 必须是 {' / '.join(LOG_LEVELS)} 之一")
+    db_path = str(raw.get("db_path") or "data/state.db").strip()
     return Config(
         plex=plex,
         emby=emby,
         mappings=mappings,
         sync=sync,
         trakt=trakt,
-        db_path=raw.get("db_path", "data/state.db"),
-        log_level=raw.get("log_level", "INFO"),
+        db_path=db_path,
+        log_level=log_level,
     )
 
 

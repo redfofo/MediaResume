@@ -22,6 +22,8 @@ MISSING_TTL = 600
 RESUME_BULK_MIN = 3
 # 引擎初始化失败（如 Emby 尚未启动）的重试间隔（秒）
 SETUP_RETRY_MIN, SETUP_RETRY_MAX = 10, 300
+# 播放中 Plex 约每 10 秒推送一次 playing 通知；超过此时间（秒）没收到，视为已不在播放（可能漏了 stopped）
+PLAYING_STALE = 120
 
 
 def decide(plex: WatchState, emby: WatchState, base: Optional[WatchState]) -> Optional[WatchState]:
@@ -142,7 +144,12 @@ class SyncEngine:
         for pair in self.pairs:
             pair.plex_since = pair.emby_since = now
         self.request_reconcile()
-        tasks = [self._worker(), self._reconcile_timer(), self._poll_loop(), self.plex.listen(self.on_plex_playing)]
+        tasks = [
+            self._worker(),
+            self._reconcile_timer(),
+            self._poll_loop(),
+            self.plex.listen(self.on_plex_playing, self._on_plex_connect),
+        ]
         if self.trakt and self.trakt.accounts:
             tasks.append(self.trakt.run())
             for direction, hours in (("to_trakt", self.cfg.trakt.push_interval), ("from_trakt", self.cfg.trakt.pull_interval)):
@@ -156,6 +163,21 @@ class SyncEngine:
                 task.cancel()
 
     # ---------- 事件入口 ----------
+
+    def _on_plex_connect(self) -> None:
+        """断线期间可能漏掉 stopped 通知：清空播放状态，仍在播放的会话很快会再次推送 playing"""
+        self._plex_playing.clear()
+        self._plex_sessions.clear()
+        self._plex_last_enqueue.clear()
+
+    def _is_playing(self, pair: Pair, rating_key: str) -> bool:
+        seen = self._plex_playing.get((pair.id, rating_key))
+        if seen is None:
+            return False
+        if time.monotonic() - seen > PLAYING_STALE:
+            del self._plex_playing[(pair.id, rating_key)]
+            return False
+        return True
 
     async def on_plex_playing(self, n: dict) -> None:
         session_key = str(n.get("sessionKey"))
@@ -433,18 +455,28 @@ class SyncEngine:
                 elif job[0] == "resume_removed":
                     await self._handle_resume_removed(*job[1:])
                 elif job[0] == "resume_sync":
-                    _, pair, src, fut = job
-                    try:
-                        fut.set_result(await self._resume_sync(pair, src))
-                    except Exception as e:
-                        fut.set_exception(e)
-                        raise
+                    await self._run_resume_sync(*job[1:])
                 elif job[0] == "trakt_pull":
                     await self._trakt_pull(*job[1:])
                 else:
                     await self._handle_event(*job)
             except Exception:
                 log.exception("处理任务失败: %s", job[:1] + job[2:])
+
+    async def _run_resume_sync(self, pair: Pair, src: str, fut: asyncio.Future) -> None:
+        # 页面请求可能已超时（future 被取消），此时结果无人接收，不能再设置
+        try:
+            result = await self._resume_sync(pair, src)
+        except asyncio.CancelledError:
+            if not fut.done():
+                fut.set_exception(RuntimeError("同步引擎已停止，任务未完成"))
+            raise
+        except Exception as e:
+            if not fut.done():
+                fut.set_exception(e)
+            raise
+        if not fut.done():
+            fut.set_result(result)
 
     async def _reconcile_timer(self) -> None:
         while True:
@@ -481,12 +513,12 @@ class SyncEngine:
         if src == "plex" and self._plex_playing_unstable(pair, item_id, src_item.state):
             log.debug("[%s] %s 正在播放且进度接近 0，可能是续播前的瞬时状态，忽略", pair.id, src_item.title)
             return
-        playing = src == "plex" and (pair.id, item_id) in self._plex_playing
+        playing = src == "plex" and self._is_playing(pair, item_id)
         # 一个文件包含多集时，对每一集分别同步
         for key in (src_item.key, *src_item.alt_keys):
             await self._sync_key(src, pair, replace(src_item, key=key, alt_keys=()))
             # Plex 正在播放时，Emby 侧的变化是我们同步过去的，不能当成“暂停”推给 Trakt
-            live = src == "plex" or not any((pair.id, i) in self._plex_playing for i in pair.plex_index.get(key, []))
+            live = src == "plex" or not any(self._is_playing(pair, i) for i in pair.plex_index.get(key, []))
             self._observe(pair, key, src_item.state, src_item.title, src_item.duration_ms, playing, live)
 
     async def _sync_key(self, src: str, pair: Pair, src_item: MediaItem) -> None:

@@ -319,8 +319,10 @@ class PlexClient:
 
     # ---------- 实时通知 ----------
 
-    async def listen(self, on_playing: Callable[[dict], Awaitable[None]]) -> None:
-        """监听 Plex WebSocket，断线自动重连"""
+    async def listen(
+        self, on_playing: Callable[[dict], Awaitable[None]], on_connect: Optional[Callable[[], None]] = None
+    ) -> None:
+        """监听 Plex WebSocket，断线自动重连；on_connect 在每次（重新）连接后调用"""
         ws_url = self.url.replace("http", "ws", 1) + "/:/websockets/notifications"
         backoff = 1
         while True:
@@ -331,6 +333,8 @@ class PlexClient:
                     log.info("Plex WebSocket 已连接")
                     self.connected = True
                     backoff = 1
+                    if on_connect:
+                        on_connect()
                     async for msg in ws:
                         if msg.type != aiohttp.WSMsgType.TEXT:
                             continue
