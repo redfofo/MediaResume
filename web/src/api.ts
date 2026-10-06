@@ -34,6 +34,7 @@ export interface ReconcileStats {
   emby?: number
   matched?: number
   changed?: number
+  failed?: number
   seconds?: number
   error?: string
 }

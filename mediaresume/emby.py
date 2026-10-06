@@ -9,11 +9,13 @@ from typing import Any, Optional
 
 import aiohttp
 
-from .models import MediaItem, MediaKey, WatchState, tmdb_from_path
+from .models import MediaItem, MediaKey, WatchState, clean_tmdb, tmdb_from_path
 
 log = logging.getLogger("emby")
 
 PAGE_SIZE = 1000
+# 增量轮询的分页大小
+CHANGED_PAGE_SIZE = 500
 TICKS_PER_MS = 10_000
 
 
@@ -30,8 +32,8 @@ def _parse_date(value: Optional[str]) -> int:
 
 def _tmdb_of(item: dict) -> Optional[str]:
     for k, v in (item.get("ProviderIds") or {}).items():
-        if k.lower() in ("tmdb", "moviedb") and v:
-            return str(v)
+        if k.lower() in ("tmdb", "moviedb") and (tmdb := clean_tmdb(v)):
+            return tmdb
     return None
 
 
@@ -198,15 +200,23 @@ class EmbyClient:
         return out
 
     async def changed_since(self, user_id: str, since: float) -> list[str]:
-        """用户数据（已看/未看/进度）在 since 之后保存过的条目"""
-        params = {
-            "Recursive": "true",
-            "IncludeItemTypes": "Movie,Episode",
-            "MinDateLastSavedForUser": datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "Limit": 500,
-        }
-        data = await self._request("GET", f"/Users/{user_id}/Items", params)
-        return [str(i["Id"]) for i in data.get("Items") or []]
+        """用户数据（已看/未看/进度）在 since 之后保存过的条目；分页取完，批量变化时不丢"""
+        out: list[str] = []
+        start = 0
+        while True:
+            params = {
+                "Recursive": "true",
+                "IncludeItemTypes": "Movie,Episode",
+                "MinDateLastSavedForUser": datetime.fromtimestamp(since, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "StartIndex": start,
+                "Limit": CHANGED_PAGE_SIZE,
+            }
+            data = await self._request("GET", f"/Users/{user_id}/Items", params)
+            items = data.get("Items") or []
+            out.extend(str(i["Id"]) for i in items)
+            start += len(items)
+            if len(items) < CHANGED_PAGE_SIZE or start >= int(data.get("TotalRecordCount", start)):
+                return out
 
     async def resume(self, user_id: str) -> list[dict]:
         """继续观看列表，每项 {group, id, title, position_ms}；group 按整部电影 / 整部剧：movie:tmdb:X / show:tmdb:X"""

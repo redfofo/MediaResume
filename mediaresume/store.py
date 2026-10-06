@@ -30,6 +30,8 @@ class StateStore:
             )
             """
         )
+        # 少量运行信息（如 Trakt 定时全量同步的上次执行时间），重启后保留
+        self.conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
         # 已见过的 Trakt 观看记录（最后观看时间），从 Trakt 拉取时只同步之后新增的观看
         self.conn.execute(
             """
@@ -73,6 +75,16 @@ class StateStore:
             self.conn.commit()
 
     def commit(self) -> None:
+        self.conn.commit()
+
+    def meta_get(self, key: str) -> Optional[str]:
+        row = self.conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return row[0] if row else None
+
+    def meta_set(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value)
+        )
         self.conn.commit()
 
     def trakt_seen(self, pair: str) -> dict[str, int]:

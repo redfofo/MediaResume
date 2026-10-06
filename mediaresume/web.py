@@ -13,7 +13,9 @@ from typing import Optional
 import aiohttp
 from aiohttp import web
 
-from .config import Config, TraktConfig, config_to_dict, load_config, parse_config, save_config
+import yaml
+
+from .config import Config, TraktConfig, config_form, config_to_dict, load_config, parse_config, save_config
 from .emby import EmbyClient
 from .engine import SyncEngine
 from .plex import PlexClient
@@ -117,7 +119,7 @@ class Runner:
         if task.cancelled():
             return
         if exc := task.exception():
-            self.error = f"同步引擎异常退出: {exc}"
+            self.error = f"同步引擎异常退出: {_describe(exc)}"
             log.error(self.error, exc_info=exc)
 
     async def _stop(self) -> None:
@@ -218,7 +220,12 @@ def create_app(runner: Runner, logs: LogBuffer, dist: Path) -> web.Application:
         try:
             cfg = load_config(runner.config_path)
         except Exception as e:
-            return web.json_response({"exists": True, "config": None, "error": str(e)})
+            # 校验不通过时仍把文件里的值回填到表单，只需改正出错的项
+            try:
+                form = config_form(yaml.safe_load(runner.config_path.read_text(encoding="utf-8")))
+            except Exception:
+                form = None
+            return web.json_response({"exists": True, "config": form, "error": str(e)})
         return web.json_response({"exists": True, "config": config_to_dict(cfg)})
 
     @routes.put("/api/config")
@@ -395,7 +402,10 @@ def create_app(runner: Runner, logs: LogBuffer, dist: Path) -> web.Application:
 
     @routes.get("/api/logs")
     async def get_logs(request: web.Request) -> web.Response:
-        after = int(request.query.get("after", 0))
+        try:
+            after = int(request.query.get("after", 0))
+        except ValueError:
+            after = 0
         return web.json_response({"seq": logs.seq, "logs": logs.since(after)})
 
     app.add_routes(routes)
@@ -414,6 +424,13 @@ def create_app(runner: Runner, logs: LogBuffer, dist: Path) -> web.Application:
     else:
         log.warning("未找到前端构建目录 %s，仅提供 API", dist)
     return app
+
+
+def _describe(exc: BaseException) -> str:
+    """TaskGroup 抛出的 ExceptionGroup 只有一句“unhandled errors in a TaskGroup”，展开成其中的原始异常"""
+    if isinstance(exc, BaseExceptionGroup):
+        return "; ".join(_describe(e) for e in exc.exceptions)
+    return f"{exc.__class__.__name__}: {exc}" if str(exc) else exc.__class__.__name__
 
 
 def _err(e: Exception) -> str:

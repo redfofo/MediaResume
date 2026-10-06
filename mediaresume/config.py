@@ -110,17 +110,26 @@ def parse_config(raw: dict[str, Any]) -> Config:
         raise ValueError("Emby 地址和 API 密钥不能为空")
     mappings = [
         Mapping(
-            plex_user=m.get("plex_user") or None,
+            plex_user=str(m.get("plex_user") or "").strip() or None,
             emby_user=str(m.get("emby_user") or "").strip(),
-            plex_token=m.get("plex_token") or None,
+            plex_token=str(m.get("plex_token") or "").strip() or None,
             trakt_user=str(m.get("trakt_user") or "").strip() or None,
         )
         for m in raw.get("mappings") or []
     ]
     if not mappings:
         raise ValueError("至少需要一个用户映射")
-    if any(not m.emby_user for m in mappings):
-        raise ValueError("用户映射中的 Emby 用户不能为空")
+    seen: set[tuple[str, str]] = set()
+    for m in mappings:
+        if not m.emby_user:
+            raise ValueError("用户映射中的 Emby 用户不能为空")
+        if m.plex_user and not m.plex_token:
+            # 否则会用所有者的 token 读写，把所有者的观看记录同步到这个用户的 Emby 账户，反之亦然
+            raise ValueError(f"Plex 用户 {m.plex_user} 需要填写该用户自己的 Token（服务器所有者请把 Plex 用户留空）")
+        pair = ((m.plex_user or "").lower(), m.emby_user.lower())
+        if pair in seen:
+            raise ValueError(f"用户映射重复：Plex[{m.plex_user or '所有者'}] ↔ Emby[{m.emby_user}]")
+        seen.add(pair)
     trakt_raw = raw.get("trakt") or {}
     trakt = TraktConfig(
         **{k: v for k, v in trakt_raw.items() if k in TraktConfig.__dataclass_fields__ and v is not None},
@@ -157,6 +166,31 @@ def load_config(path: str | Path) -> Config:
 
 def config_to_dict(cfg: Config) -> dict[str, Any]:
     return asdict(cfg)
+
+
+def config_form(raw: Any) -> dict[str, Any]:
+    """配置文件无效时也尽量回填到页面表单：以默认值为底，逐段覆盖文件中的值，
+    避免升级后因校验变严而要把 token 等全部重填"""
+    form = config_to_dict(Config(PlexConfig("", ""), EmbyConfig("", ""), []))
+    if not isinstance(raw, dict):
+        return form
+    for section in ("plex", "emby", "sync", "trakt"):
+        if isinstance(raw.get(section), dict):
+            form[section].update({k: v for k, v in raw[section].items() if k in form[section] and v is not None})
+    for k in ("db_path", "log_level"):
+        if raw.get(k) is not None:
+            form[k] = raw[k]
+    form["mappings"] = [
+        {
+            "plex_user": m.get("plex_user") or None,
+            "emby_user": str(m.get("emby_user") or ""),
+            "plex_token": m.get("plex_token") or None,
+            "trakt_user": m.get("trakt_user") or None,
+        }
+        for m in raw.get("mappings") or []
+        if isinstance(m, dict)
+    ]
+    return form
 
 
 def save_config(cfg: Config, path: str | Path) -> None:

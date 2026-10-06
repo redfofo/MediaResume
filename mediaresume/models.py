@@ -68,12 +68,18 @@ def merge_states(items: list[MediaItem]) -> WatchState:
     return WatchState(played=played, position_ms=0 if played else position, last_played=last)
 
 
+def clean_tmdb(value: object) -> Optional[str]:
+    """只接受纯数字的 tmdb id：推送 Trakt 时要转成整数，一条坏数据会让整批推送失败"""
+    s = str(value or "").strip()
+    return s if s.isdigit() else None
+
+
 def parse_tmdb(value: str) -> Optional[str]:
     """解析 Plex guid（新/旧 agent）中的 tmdb id"""
     if value.startswith("tmdb://"):
-        return value[len("tmdb://"):]
+        return clean_tmdb(value[len("tmdb://"):])
     if value.startswith("com.plexapp.agents.themoviedb://"):
-        return value.split("://", 1)[1].split("?", 1)[0].split("/", 1)[0]
+        return clean_tmdb(value.split("://", 1)[1].split("?", 1)[0].split("/", 1)[0])
     return None
 
 

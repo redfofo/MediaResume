@@ -536,3 +536,53 @@ def test_reauthorize_resumes_account(tmp_path):
     assert not acc.auth_failed and acc.error is None
     sync.observe_live("me", EP1, *progress(30))
     assert EP1 in acc.pending
+
+
+def test_pull_does_not_mark_missing_items_seen(tmp_path):
+    # MOVIE 在 Trakt 上看过但本地还没入库：不能记为已见，否则入库后永远不会拉取
+    client = FakeClient(watched={EP1, MOVIE})
+    eng, pair, *_ = make_engine(tmp_path, [MediaItem("plex", "1", EP1, WatchState(False, 0))], [], client=client)
+    run(eng._reconcile(pair))
+    _, (watched, _, seen) = run(eng.trakt_plan(pair, "from_trakt"))
+    assert set(watched) == {EP1} and set(seen) == {EP1}
+
+
+class FlakyServer(Server):
+    """对指定条目的写入抛异常"""
+
+    def __init__(self, name, items, broken):
+        super().__init__(name, items)
+        self.broken = broken
+
+    async def mark_played(self, *args):
+        item_id = args[0] if self.name == "plex" else args[1]
+        if item_id in self.broken:
+            raise RuntimeError("404 Not Found")
+        await super().mark_played(*args)
+
+
+def test_reconcile_continues_after_item_failure(tmp_path):
+    eng, pair, *_ = make_engine(tmp_path, [], [])
+    eng.plex = FlakyServer(
+        "plex",
+        [MediaItem("plex", "1", EP1, WatchState(False, 0)), MediaItem("plex", "2", EP2, WatchState(False, 0))],
+        broken={"1"},
+    )
+    eng.emby = Server("emby", [MediaItem("emby", "a", EP1, played()), MediaItem("emby", "b", EP2, played())])
+    run(eng._reconcile(pair))
+    assert eng.plex.ops == [("played", "2")]
+    assert eng.reconcile_stats[pair.id]["failed"] == 1
+    assert eng.store.get(pair.id, EP2).played and eng.store.get(pair.id, EP1) is None
+
+
+def test_failed_pull_is_not_marked_seen(tmp_path):
+    eng, pair, *_ = make_engine(tmp_path, [], [])
+    eng.plex = FlakyServer(
+        "plex",
+        [MediaItem("plex", "1", EP1, WatchState(False, 0)), MediaItem("plex", "2", EP2, WatchState(False, 0))],
+        broken={"1"},
+    )
+    pair.plex_index.update({EP1: ["1"], EP2: ["2"]})
+    run(eng._trakt_pull(pair, {EP1: NOW, EP2: NOW}, {}, {EP1: NOW, EP2: NOW}))
+    assert eng.plex.ops == [("played", "2")]
+    assert eng.store.trakt_seen(pair.id) == {str(EP2): NOW}  # EP1 下次重试

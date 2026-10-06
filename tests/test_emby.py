@@ -39,3 +39,20 @@ def test_date_played_is_utc_regardless_of_container_tz(monkeypatch):
     finally:
         monkeypatch.delenv("TZ")
         time.tzset()
+
+
+def test_changed_since_reads_all_pages(monkeypatch):
+    from mediaresume import emby
+
+    monkeypatch.setattr(emby, "CHANGED_PAGE_SIZE", 2)
+    ids = [str(n) for n in range(5)]
+
+    class Pager(EmbyClient):
+        def __init__(self):
+            super().__init__(None, "http://e", "k")
+
+        async def _request(self, method, path, params=None, body=None):
+            start = params["StartIndex"]
+            return {"Items": [{"Id": i} for i in ids[start:start + params["Limit"]]], "TotalRecordCount": len(ids)}
+
+    assert asyncio.run(Pager().changed_since("u", 0)) == ids

@@ -142,6 +142,7 @@ onUnmounted(() => window.clearInterval(timer))
             <span v-else>
               Plex {{ row.reconcile.plex }} · Emby {{ row.reconcile.emby }} · 匹配 {{ row.reconcile.matched }} ·
               同步 {{ row.reconcile.changed }} · {{ row.reconcile.seconds }}s
+              <el-text v-if="row.reconcile.failed" type="danger">· 失败 {{ row.reconcile.failed }}（详见日志）</el-text>
             </span>
           </template>
         </el-table-column>

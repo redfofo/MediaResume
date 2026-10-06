@@ -213,3 +213,67 @@ def test_store_bulk_read_and_batched_commit(tmp_path):
     assert StateStore(path).all("p") == {}  # 未提交，其他连接看不到
     store.commit()
     assert StateStore(path).all("p") == {str(MOVIE): WatchState(False, 1000, 5)}
+
+
+def test_timed_out_resume_sync_is_not_executed():
+    eng, pair = make_engine()
+    called = []
+
+    async def fake_sync(*_):
+        called.append(1)
+        return {}
+
+    eng._resume_sync = fake_sync
+
+    async def main():
+        fut = asyncio.get_running_loop().create_future()
+        fut.cancel()
+        await eng._run_resume_sync(pair, "plex", fut)
+
+    run(main())
+    assert called == []
+
+
+def make_timer_engine(tmp_path):
+    from mediaresume.store import StateStore
+
+    eng, _ = make_engine()
+    eng.store = StateStore(str(tmp_path / "s.db"))
+    calls = []
+
+    async def scheduled(direction):
+        calls.append(direction)
+
+    eng.trakt_scheduled = scheduled
+    return eng, calls
+
+
+def test_trakt_timer_resumes_after_restart(tmp_path):
+    eng, calls = make_timer_engine(tmp_path)
+    eng.store.meta_set("trakt_last_to_trakt", str(time.time() - 7200))  # 停机期间已到期
+
+    async def main():
+        task = asyncio.create_task(eng._trakt_timer("to_trakt", 3600))
+        await asyncio.sleep(0.05)
+        before = list(calls)  # 首次对账前不执行
+        eng._reconciled.set()
+        await asyncio.sleep(0.05)
+        task.cancel()
+        return before
+
+    assert run(main()) == [] and calls == ["to_trakt"]
+    assert time.time() - float(eng.store.meta_get("trakt_last_to_trakt")) < 5
+    assert abs(eng.trakt_next["to_trakt"] - (time.time() + 3600)) < 5
+
+
+def test_trakt_timer_first_start_records_baseline(tmp_path):
+    eng, calls = make_timer_engine(tmp_path)
+
+    async def main():
+        task = asyncio.create_task(eng._trakt_timer("from_trakt", 3600))
+        await asyncio.sleep(0.05)
+        task.cancel()
+
+    run(main())
+    assert calls == [] and eng.store.meta_get("trakt_last_from_trakt") is not None
+    assert abs(eng.trakt_next["from_trakt"] - (time.time() + 3600)) < 5

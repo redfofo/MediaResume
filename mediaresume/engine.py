@@ -111,6 +111,8 @@ class SyncEngine:
         # pair_id -> 最近一次对账结果，供 Web 状态页展示
         self.reconcile_stats: dict[str, dict] = {}
         self.reconciling = False
+        # 首次对账完成（无论成败）后置位，定时 Trakt 全量同步要等它
+        self._reconciled = asyncio.Event()
         # Trakt 定时全量同步的下次执行时间（unix 秒）：方向 -> 时间
         self.trakt_next: dict[str, float] = {}
         self.last_poll: Optional[float] = None
@@ -269,7 +271,14 @@ class SyncEngine:
         for rk in movie_candidates:
             self.queue.put_nowait(("plex", pair, rk))
         for show_rk in show_candidates:
-            for ep in await self.plex.show_episodes(show_rk, pair.plex_token):
+            try:
+                episodes = await self.plex.show_episodes(show_rk, pair.plex_token)
+            except Exception as e:
+                # 快照已更新，这部剧放回活动集合，下一轮再核对
+                pair.plex_active_shows.add(show_rk)
+                log.warning("[%s] 读取 Plex 剧集 %s 失败: %s", pair.id, show_rk, str(e) or e.__class__.__name__)
+                continue
+            for ep in episodes:
                 base = self.store.get(pair.id, ep.key)
                 if not ep.state.played and base is not None and base.played:
                     self.queue.put_nowait(("plex", pair, ep.item_id))
@@ -470,7 +479,10 @@ class SyncEngine:
                 log.exception("处理任务失败: %s", job[:1] + job[2:])
 
     async def _run_resume_sync(self, pair: Pair, src: str, fut: asyncio.Future) -> None:
-        # 页面请求可能已超时（future 被取消），此时结果无人接收，不能再设置
+        if fut.done():
+            # 页面请求已超时并提示失败，不能在之后悄悄执行
+            log.info("[%s] 手动同步继续观看的请求已超时，取消执行", pair.id)
+            return
         try:
             result = await self._resume_sync(pair, src)
         except asyncio.CancelledError:
@@ -563,6 +575,7 @@ class SyncEngine:
                     self.reconcile_stats[pair.id] = {"at": time.time(), "error": str(e)}
         finally:
             self.reconciling = False
+            self._reconciled.set()
 
     async def _reconcile(self, pair: Pair) -> None:
         started = time.monotonic()
@@ -577,30 +590,19 @@ class SyncEngine:
         for key in pair.unified.keys() - plex_groups.keys() - emby_groups.keys():
             del pair.unified[key]
         bases = self.store.all(pair.id)
-        pending = 0
+        pending = failed = 0
         try:
             for key in plex_groups.keys() & emby_groups.keys():
                 p_items, e_items = plex_groups[key], emby_groups[key]
-                p, e = merge_states(p_items), merge_states(e_items)
-                base = bases.get(str(key))
-                target = decide(p, e, base)
-                self._observe(pair, key, target or _agreed(p, e), p_items[0].title, _duration(p_items + e_items))
-                if target is None:
-                    if not p.same_as(base):
-                        self.store.set(pair.id, key, p, commit=False)
-                        pending += 1
-                else:
-                    title = p_items[0].title or str(key)
-                    if not target.same_as(p):
-                        log.info("[%s] 对账 emby → plex: %s %s", pair.id, title, _fmt(target))
-                        await self._apply("plex", pair, p_items, target)
-                    if not target.same_as(e):
-                        log.info("[%s] 对账 plex → emby: %s %s", pair.id, title, _fmt(target))
-                        await self._apply("emby", pair, e_items, target)
-                    if not self.cfg.sync.dry_run:
-                        self.store.set(pair.id, key, target, commit=False)
-                        pending += 1
-                    changed += 1
+                try:
+                    result = await self._reconcile_key(pair, key, p_items, e_items, bases.get(str(key)))
+                except Exception as e:
+                    # 单个条目写入失败（如刚被删除）不能中断整轮：否则它之后的条目每轮都对不上
+                    failed += 1
+                    log.warning("[%s] 对账 %s 失败: %s", pair.id, p_items[0].title or key, str(e) or e.__class__.__name__)
+                    continue
+                changed += result == "changed"
+                pending += result is not None
                 if pending >= COMMIT_EVERY:
                     self.store.commit()
                     pending = 0
@@ -612,13 +614,37 @@ class SyncEngine:
             "emby": len(emby_groups),
             "matched": len(plex_groups.keys() & emby_groups.keys()),
             "changed": changed,
+            "failed": failed,
             "seconds": round(time.monotonic() - started, 1),
         }
         self.reconcile_stats[pair.id] = stats
         log.info(
-            "[%s] 对账完成：Plex %d 项，Emby %d 项，匹配 %d 项，同步 %d 项，用时 %.1fs",
-            pair.id, stats["plex"], stats["emby"], stats["matched"], changed, stats["seconds"],
+            "[%s] 对账完成：Plex %d 项，Emby %d 项，匹配 %d 项，同步 %d 项，失败 %d 项，用时 %.1fs",
+            pair.id, stats["plex"], stats["emby"], stats["matched"], changed, failed, stats["seconds"],
         )
+
+    async def _reconcile_key(
+        self, pair: Pair, key: MediaKey, p_items: list[MediaItem], e_items: list[MediaItem], base: Optional[WatchState]
+    ) -> Optional[str]:
+        """对账单个条目；返回 "changed"（两端有写入）、"stored"（只更新了基准）或 None。基准由调用方批量提交"""
+        p, e = merge_states(p_items), merge_states(e_items)
+        target = decide(p, e, base)
+        self._observe(pair, key, target or _agreed(p, e), p_items[0].title, _duration(p_items + e_items))
+        if target is None:
+            if p.same_as(base):
+                return None
+            self.store.set(pair.id, key, p, commit=False)
+            return "stored"
+        title = p_items[0].title or str(key)
+        if not target.same_as(p):
+            log.info("[%s] 对账 emby → plex: %s %s", pair.id, title, _fmt(target))
+            await self._apply("plex", pair, p_items, target)
+        if not target.same_as(e):
+            log.info("[%s] 对账 plex → emby: %s %s", pair.id, title, _fmt(target))
+            await self._apply("emby", pair, e_items, target)
+        if not self.cfg.sync.dry_run:
+            self.store.set(pair.id, key, target, commit=False)
+        return "changed"
 
     def _observe(
         self,
@@ -708,7 +734,8 @@ class SyncEngine:
                     skipped += 1  # 本地更新
                     continue
                 pull_progress[key] = (pb.progress, pb.paused_at)
-            plan = (pull_watched, pull_progress, watched)
+            # 只把本地媒体库已有的条目记为已见：拉取时还没入库的，入库后仍应拉取
+            plan = (pull_watched, pull_progress, {k: ts for k, ts in watched.items() if k in pair.unified})
             show = {
                 "watched": [entry(k, watched_at=ts) for k, ts in pull_watched.items()],
                 "progress": [
@@ -749,10 +776,23 @@ class SyncEngine:
         return {k: len(v) if isinstance(v, list) else v for k, v in show.items()}
 
     async def _trakt_timer(self, direction: str, interval: float) -> None:
+        """上次执行时间存在数据库中，重启（保存配置、容器更新）后接着计时，而不是从头开始"""
+        key = f"trakt_last_{direction}"
+        last = self.store.meta_get(key)
+        if last is None:
+            # 首次启用：从现在开始计时，并记下来，避免频繁重启时永远等不到
+            last = str(time.time())
+            self.store.meta_set(key, last)
+        due = float(last) + interval
         while True:
-            self.trakt_next[direction] = time.time() + interval
-            await asyncio.sleep(interval)
+            self.trakt_next[direction] = due
+            await asyncio.sleep(max(0.0, due - time.time()))
+            # 停机期间已到期的，等首次对账完成再执行；否则会因“尚未完成首次对账”被跳过，白等一整个周期
+            await self._reconciled.wait()
             await self.trakt_scheduled(direction)
+            now = time.time()
+            self.store.meta_set(key, str(now))
+            due = now + interval
 
     async def trakt_scheduled(self, direction: str) -> None:
         """定时全量同步：与页面手动执行相同；尚未完成首次对账或已有全量同步在执行时跳过本轮"""
@@ -782,32 +822,42 @@ class SyncEngine:
             pair.id, pair.mapping.trakt_user, len(watched), len(progress), "（dry-run）" if self.cfg.sync.dry_run else "",
         )
         n_watched = n_progress = 0
+        failed: set[MediaKey] = set()
         for key, watched_at in watched.items():
-            p_items, e_items = await self._items_for(pair, key)
-            if all(i.state.played for i in p_items + e_items):
-                continue  # 包括两端都没有
-            target = WatchState(True, 0, watched_at)
-            log.info("[%s] trakt → plex/emby: %s %s", pair.id, (p_items + e_items)[0].title or key, _fmt(target))
-            await self._apply("plex", pair, p_items, target)
-            await self._apply("emby", pair, e_items, target)
+            try:
+                p_items, e_items = await self._items_for(pair, key)
+                if all(i.state.played for i in p_items + e_items):
+                    continue  # 包括两端都没有
+                target = WatchState(True, 0, watched_at)
+                log.info("[%s] trakt → plex/emby: %s %s", pair.id, (p_items + e_items)[0].title or key, _fmt(target))
+                await self._apply("plex", pair, p_items, target)
+                await self._apply("emby", pair, e_items, target)
+            except Exception as e:
+                failed.add(key)
+                log.warning("[%s] 从 Trakt 标记已看 %s 失败: %s", pair.id, key, str(e) or e.__class__.__name__)
+                continue
             if not self.cfg.sync.dry_run:
                 self.store.set(pair.id, key, target)
             n_watched += 1
         acc = self.trakt.accounts.get(pair.mapping.trakt_user)
         for key, (pct, paused_at) in progress.items():
-            # 执行时重新读取，跳过计划生成后本地又有变化的条目
-            p_items, e_items = await self._items_for(pair, key)
-            items = p_items + e_items
-            duration = _duration(items)
-            if not items or duration <= 0:
+            try:
+                # 执行时重新读取，跳过计划生成后本地又有变化的条目
+                p_items, e_items = await self._items_for(pair, key)
+                items = p_items + e_items
+                duration = _duration(items)
+                if not items or duration <= 0:
+                    continue
+                cur = merge_states(items)
+                if cur.played or paused_at <= cur.last_played or not _progress_differs(cur, duration, pct):
+                    continue
+                target = WatchState(False, int(duration * pct / 100), paused_at)
+                log.info("[%s] trakt → plex/emby: %s %s", pair.id, items[0].title or key, _fmt(target))
+                await self._apply("plex", pair, p_items, target)
+                await self._apply("emby", pair, e_items, target)
+            except Exception as e:
+                log.warning("[%s] 从 Trakt 写入进度 %s 失败: %s", pair.id, key, str(e) or e.__class__.__name__)
                 continue
-            cur = merge_states(items)
-            if cur.played or paused_at <= cur.last_played or not _progress_differs(cur, duration, pct):
-                continue
-            target = WatchState(False, int(duration * pct / 100), paused_at)
-            log.info("[%s] trakt → plex/emby: %s %s", pair.id, items[0].title or key, _fmt(target))
-            await self._apply("plex", pair, p_items, target)
-            await self._apply("emby", pair, e_items, target)
             if not self.cfg.sync.dry_run:
                 self.store.set(pair.id, key, target)
             if acc:
@@ -815,8 +865,12 @@ class SyncEngine:
                 acc.progress_sent[key] = (pct, False)
             n_progress += 1
         if seen and not self.cfg.sync.dry_run:
-            self.store.set_trakt_seen(pair.id, seen)
-        log.info("[%s] 从 Trakt 全量同步完成：标记已看 %d 条，写入进度 %d 条", pair.id, n_watched, n_progress)
+            # 写入失败的不记为已见，下次拉取时重试
+            self.store.set_trakt_seen(pair.id, {k: ts for k, ts in seen.items() if k not in failed})
+        log.info(
+            "[%s] 从 Trakt 全量同步完成：标记已看 %d 条，写入进度 %d 条%s",
+            pair.id, n_watched, n_progress, f"，失败 {len(failed)} 条（下次重试）" if failed else "",
+        )
 
     # ---------- 服务器操作封装 ----------
 

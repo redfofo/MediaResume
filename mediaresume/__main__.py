@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import signal
 from pathlib import Path
 
 import aiohttp
@@ -26,8 +27,17 @@ async def main(config_path: Path, host: str, port: int) -> None:
         await web.TCPSite(app_runner, host, port).start()
         logging.getLogger("web").info("Web 管理页面: http://%s:%d", host, port)
         await runner.start()
+        # 容器里本进程是 PID 1，没有处理函数时内核会忽略 SIGTERM，docker stop 要等 10 秒后强杀。
+        # 收到信号后正常退出：停止引擎、提交数据库
+        stop = asyncio.Event()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                asyncio.get_running_loop().add_signal_handler(sig, stop.set)
+            except NotImplementedError:  # Windows
+                pass
         try:
-            await asyncio.Event().wait()
+            await stop.wait()
+            logging.getLogger("web").info("收到停止信号，正在退出")
         finally:
             await runner.stop()
             await app_runner.cleanup()

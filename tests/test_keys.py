@@ -40,3 +40,14 @@ def test_emby_falls_back_to_series_metadata():
     e._series_tmdb["s1"] = "45790"
     raw = {"Type": "Episode", "Id": "1", "SeriesId": "s1", "ParentIndexNumber": 5, "IndexNumber": 13, "Path": "/x/a.strm"}
     assert e._to_item(raw).key == MediaKey("episode", "45790", 5, 13)
+
+
+def test_non_numeric_tmdb_is_ignored():
+    from mediaresume.emby import _tmdb_of
+    from mediaresume.models import parse_tmdb
+
+    assert parse_tmdb("tmdb://603") == "603"
+    assert parse_tmdb("tmdb://abc") is None
+    assert parse_tmdb("com.plexapp.agents.themoviedb://1399?lang=en") == "1399"
+    assert _tmdb_of({"ProviderIds": {"Tmdb": "tt0133093", "MovieDb": "603"}}) == "603"
+    assert _tmdb_of({"ProviderIds": {"Tmdb": " 603 "}}) == "603"

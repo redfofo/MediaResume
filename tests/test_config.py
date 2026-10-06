@@ -122,3 +122,84 @@ def test_allowed_hosts(tmp_path, monkeypatch):
             return ok.status, evil.status, lan.status
 
     assert asyncio.run(main()) == (200, 421, 200)
+
+
+def test_shared_plex_user_requires_own_token():
+    with pytest.raises(ValueError, match="需要填写该用户自己的 Token"):
+        parse_config(base(mappings=[{"plex_user": "kid", "emby_user": "k"}]))
+    cfg = parse_config(base(mappings=[{"plex_user": " kid ", "plex_token": " tk ", "emby_user": "k"}]))
+    assert (cfg.mappings[0].plex_user, cfg.mappings[0].plex_token) == ("kid", "tk")
+
+
+def test_duplicate_mappings_rejected():
+    with pytest.raises(ValueError, match="用户映射重复"):
+        parse_config(base(mappings=[{"emby_user": "U"}, {"emby_user": "u"}]))
+    parse_config(base(mappings=[{"emby_user": "u"}, {"plex_user": "kid", "plex_token": "t", "emby_user": "u"}]))
+
+
+def test_engine_crash_reason_is_unwrapped():
+    from mediaresume.web import _describe
+
+    eg = ExceptionGroup("unhandled errors in a TaskGroup", [ValueError("Emby 401")])
+    assert _describe(eg) == "ValueError: Emby 401"
+    assert _describe(ExceptionGroup("x", [KeyError("a"), RuntimeError()])) == "KeyError: 'a'; RuntimeError"
+
+
+def test_logs_tolerates_bad_cursor(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    async def main():
+        async with TestClient(TestServer(make_app(tmp_path, monkeypatch))) as client:
+            return (await client.get("/api/logs?after=abc")).status
+
+    assert asyncio.run(main()) == 200
+
+
+def test_invalid_config_is_still_prefilled(tmp_path, monkeypatch):
+    from aiohttp.test_utils import TestClient, TestServer
+
+    (tmp_path / "config.yaml").write_text(
+        "plex: {url: 'http://p', token: secret}\nemby: {url: 'http://e', api_key: k}\n"
+        "mappings: [{plex_user: kid, emby_user: u}]\nsync: {poll_interval: 10}\n",
+        encoding="utf-8",
+    )
+
+    async def main():
+        async with TestClient(TestServer(make_app(tmp_path, monkeypatch))) as client:
+            return await (await client.get("/api/config")).json()
+
+    res = asyncio.run(main())
+    assert "需要填写该用户自己的 Token" in res["error"]
+    cfg = res["config"]
+    assert cfg["plex"]["token"] == "secret" and cfg["sync"]["poll_interval"] == 10
+    assert cfg["sync"]["reconcile_interval"] == 900  # 缺的项用默认值
+    assert cfg["mappings"] == [{"plex_user": "kid", "emby_user": "u", "plex_token": None, "trakt_user": None}]
+
+
+def test_sigterm_exits_gracefully(tmp_path):
+    import signal
+    import socket
+    import subprocess
+    import sys
+    import time
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "mediaresume", "-c", str(tmp_path / "config.yaml"), "--host", "127.0.0.1", "-p", str(port)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    try:
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+                break
+            except OSError:
+                time.sleep(0.1)
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=5)
+    finally:
+        proc.kill()
+    assert proc.returncode == 0 and "收到停止信号" in out
