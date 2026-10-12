@@ -129,6 +129,7 @@ class PlexClient:
         return MediaItem(
             "plex", str(meta["ratingKey"]), key, self._state_of(meta), meta.get("title", ""),
             duration_ms=int(meta.get("duration") or 0),
+            added_at=int(meta.get("addedAt") or 0),
         )
 
     async def get_item(self, rating_key: str, token: Optional[str] = None) -> Optional[MediaItem]:

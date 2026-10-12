@@ -49,6 +49,16 @@ watch(newestFirst, (desc) => {
   scrollToNewest()
 })
 
+async function releaseHeld(user: string, action: 'confirm' | 'discard') {
+  try {
+    const { count } = await api.traktHeld(user, action)
+    ElMessage.success(action === 'confirm' ? `已确认，将删除 ${count} 个条目的观看记录` : `已丢弃 ${count} 个条目`)
+    emit('refresh')
+  } catch (e) {
+    ElMessage.error((e as Error).message)
+  }
+}
+
 async function run(action: 'reconcile' | 'restart') {
   busy.value = true
   try {
@@ -181,6 +191,19 @@ onUnmounted(() => window.clearInterval(timer))
           下次定时从 Trakt 同步：{{ fmtTime(status.trakt_next.from_trakt) }}
         </el-text>
       </div>
+      <el-alert
+        v-for="acc in status.trakt.filter((a) => a.held.length)"
+        :key="acc.user"
+        type="warning"
+        show-icon
+        :closable="false"
+        class="trakt-held"
+        :title="`Trakt[${acc.user}]：短时间内被标记未看的条目过多，疑似媒体库异常，已暂停删除 ${acc.held.length} 个条目的观看记录`"
+      >
+        <div class="held-titles">{{ acc.held.slice(0, 20).join('、') }}{{ acc.held.length > 20 ? ` 等 ${acc.held.length} 项` : '' }}</div>
+        <el-button size="small" type="danger" @click="releaseHeld(acc.user, 'confirm')">确认删除</el-button>
+        <el-button size="small" @click="releaseHeld(acc.user, 'discard')">丢弃，不删除</el-button>
+      </el-alert>
       <el-table :data="status.trakt">
         <el-table-column prop="user" label="账户" min-width="120" />
         <el-table-column label="最近推送" min-width="170">
@@ -278,6 +301,13 @@ onUnmounted(() => window.clearInterval(timer))
 }
 .log-msg {
   white-space: pre-wrap;
+  word-break: break-all;
+}
+.trakt-held {
+  margin-bottom: 8px;
+}
+.held-titles {
+  margin: 4px 0 8px;
   word-break: break-all;
 }
 .trakt-next {

@@ -28,6 +28,12 @@ class TraktConfig:
     client_secret: str = ""
     # 实时播放进度推送到 Trakt（正在观看 / 暂停进度 / 看完）
     scrobble: bool = True
+    # 在 Plex / Emby 中标记已看、清除进度时，实时同步到 Trakt（补观看记录 / 删除进度）
+    sync_marks: bool = True
+    # 把已看的条目标记为未看时，删除 Trakt 上该条目的全部观看记录（删除前备份到 data/trakt_removed.jsonl）
+    sync_unwatch: bool = False
+    # 1 小时内被标记未看的电影 / 剧超过此数量时暂停删除，等待在页面确认（防止媒体库重建时误删）
+    unwatch_max: int = 10
     # 定时全量同步到 Trakt / 从 Trakt 全量同步的间隔（小时），0 表示只手动执行
     push_interval: int = 0
     pull_interval: int = 0
@@ -138,6 +144,9 @@ def parse_config(raw: dict[str, Any]) -> Config:
     trakt.push_interval = _as_int(trakt.push_interval, "Trakt 定时全量同步间隔（小时）", 0)
     trakt.pull_interval = _as_int(trakt.pull_interval, "Trakt 定时全量同步间隔（小时）", 0)
     trakt.scrobble = _as_bool(trakt.scrobble, "trakt.scrobble")
+    trakt.sync_marks = _as_bool(trakt.sync_marks, "trakt.sync_marks")
+    trakt.sync_unwatch = _as_bool(trakt.sync_unwatch, "trakt.sync_unwatch")
+    trakt.unwatch_max = _as_int(trakt.unwatch_max, "标记未看的暂停阈值", 1)
     if any(m.trakt_user for m in mappings) and not trakt.client_id:
         raise ValueError("用户映射绑定了 Trakt 账户，需要填写 Trakt Client ID")
     sync_raw = raw.get("sync") or {}

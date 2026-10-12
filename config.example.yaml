@@ -16,6 +16,9 @@ trakt:                            # 可选：自建 Trakt App，Redirect URI 填
   client_id:
   client_secret:                  # 可选：新建的 App 不再提供 Secret（显示 Not issued），留空即可
   scrobble: true                  # 实时推送播放进度到 Trakt
+  sync_marks: true                # 在 Plex / Emby 中标记已看 / 清除进度时，实时同步到 Trakt
+  sync_unwatch: false             # 把已看的条目标记为未看时，删除 Trakt 上的全部观看记录（删除前备份到 data/trakt_removed.jsonl）
+  unwatch_max: 10                 # 1 小时内标记未看的电影 / 剧超过此数量时暂停删除，在 Web 页面确认
   push_interval: 0                # 定时全量同步到 Trakt 的间隔（小时），0 表示只在 Web 页面手动执行
   pull_interval: 0                # 定时从 Trakt 全量同步的间隔（小时），0 表示只在 Web 页面手动执行
 

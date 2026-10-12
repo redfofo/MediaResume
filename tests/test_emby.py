@@ -56,3 +56,21 @@ def test_changed_since_reads_all_pages(monkeypatch):
             return {"Items": [{"Id": i} for i in ids[start:start + params["Limit"]]], "TotalRecordCount": len(ids)}
 
     assert asyncio.run(Pager().changed_since("u", 0)) == ids
+
+
+def test_get_item_reads_date_created():
+    class Item(EmbyClient):
+        def __init__(self):
+            super().__init__(None, "http://e", "k")
+            self.params = None
+
+        async def _request(self, method, path, params=None, body=None):
+            self.params = params
+            return {
+                "Id": "1", "Type": "Movie", "Name": "M", "ProviderIds": {"Tmdb": "603"},
+                "DateCreated": "2023-11-14T22:13:20.0000000Z", "UserData": {"Played": False},
+            }
+
+    c = Item()
+    item = asyncio.run(c.get_item("u", "1"))
+    assert item.added_at == 1_700_000_000 and "DateCreated" in c.params["Fields"]

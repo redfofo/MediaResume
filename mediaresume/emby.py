@@ -128,12 +128,14 @@ class EmbyClient:
         return MediaItem("emby", str(item["Id"]), key, self._state_of(item), item.get("Name", ""), alt_keys, duration)
 
     async def get_item(self, user_id: str, item_id: str) -> Optional[MediaItem]:
-        data = await self._request("GET", f"/Users/{user_id}/Items/{item_id}", {"Fields": FIELDS})
+        # 入库时间只在单条读取时需要（判断标记未看是否其实是重新入库），全量列表不取
+        data = await self._request("GET", f"/Users/{user_id}/Items/{item_id}", {"Fields": FIELDS + ",DateCreated"})
         if not data:
             return None
         if data.get("Type") == "Episode" and data.get("SeriesId"):
             await self._series_tmdb_id(user_id, str(data["SeriesId"]))
-        return self._to_item(data)
+        item = self._to_item(data)
+        return replace(item, added_at=_parse_date(data.get("DateCreated"))) if item else None
 
     async def _list(self, user_id: str, types: str) -> list[dict]:
         out: list[dict] = []

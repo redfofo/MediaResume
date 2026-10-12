@@ -98,7 +98,8 @@ class Runner:
             trakt = None
             if any(m.trakt_user for m in self.cfg.mappings):
                 client = TraktClient(self.http, self.cfg.trakt, self.trakt_tokens)
-                trakt = TraktSync(client, self.cfg.trakt, self.cfg.sync.dry_run)
+                removed_log = self.config_path.parent / "data" / "trakt_removed.jsonl"
+                trakt = TraktSync(client, self.cfg.trakt, self.cfg.sync.dry_run, removed_log)
             self.engine = SyncEngine(
                 self.cfg,
                 PlexClient(self.http, self.cfg.plex.url, self.cfg.plex.token),
@@ -342,6 +343,22 @@ def create_app(runner: Runner, logs: LogBuffer, dist: Path) -> web.Application:
             except Exception as e:
                 pairs.append({**_pair_info(p), "error": _err(e)})
         return web.json_response({"pairs": pairs})
+
+    @routes.post("/api/trakt/held")
+    async def trakt_held(request: web.Request) -> web.Response:
+        """确认或丢弃因数量过多而暂停的标记未看（删除 Trakt 观看记录）"""
+        body = await request.json()
+        action = body.get("action")
+        if action not in ("confirm", "discard"):
+            raise web.HTTPBadRequest(text='{"error": "action 必须是 confirm 或 discard"}', content_type="application/json")
+        eng = _running_engine()
+        if not eng.trakt:
+            raise web.HTTPConflict(text='{"error": "未启用 Trakt 同步"}', content_type="application/json")
+        try:
+            count = eng.trakt.release_held(str(body.get("user") or ""), action == "confirm")
+        except ValueError as e:
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"count": count})
 
     @routes.delete("/api/trakt/accounts/{username}")
     async def trakt_delete_account(request: web.Request) -> web.Response:

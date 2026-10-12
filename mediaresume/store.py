@@ -59,6 +59,13 @@ class StateStore:
         rows = self.conn.execute("SELECT media_key, played, position_ms, last_played FROM sync_state WHERE pair=?", (pair,))
         return {k: WatchState(played=bool(p), position_ms=pos, last_played=last) for k, p, pos, last in rows}
 
+    def updated_at(self, pair: str, key: MediaKey) -> Optional[int]:
+        """基准最后一次写入的时间（unix 秒）"""
+        row = self.conn.execute(
+            "SELECT updated_at FROM sync_state WHERE pair=? AND media_key=?", (pair, str(key))
+        ).fetchone()
+        return row[0] if row else None
+
     def set(self, pair: str, key: MediaKey, state: WatchState, commit: bool = True) -> None:
         """commit=False 时由调用方批量提交（见 commit）"""
         self.conn.execute(

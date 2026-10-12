@@ -271,6 +271,22 @@ onMounted(async () => {
           播放时 Trakt 显示“正在观看”，暂停 / 停止时保存进度，看完时记录一次观看
         </el-text>
       </el-form-item>
+      <el-form-item label="实时同步标记已看">
+        <el-switch v-model="cfg.trakt.sync_marks" />
+        <el-text type="info" class="switch-hint">
+          在 Plex / Emby 中标记已看时补一条观看记录，看到一半时标记未看 / 清除进度则删除 Trakt 上的进度；约 1 分钟后推送，期间改回则取消
+        </el-text>
+      </el-form-item>
+      <el-form-item label="标记未看时删除 Trakt 观看记录">
+        <el-switch v-model="cfg.trakt.sync_unwatch" />
+        <el-text type="info" class="switch-hint">
+          把已看的条目标记为未看时，删除 Trakt 上该条目的全部观看记录（Trakt 无法撤销，删除前备份到 data/trakt_removed.jsonl）。重新入库的条目不会删除
+        </el-text>
+      </el-form-item>
+      <el-form-item v-if="cfg.trakt.sync_unwatch" label="暂停阈值（1 小时内电影 / 剧数）">
+        <el-input-number v-model="cfg.trakt.unwatch_max" :min="1" :step="1" step-strictly />
+        <el-text type="info" class="switch-hint">超过时暂停删除，在“运行状态”页确认后再执行，防止媒体库重建时误删</el-text>
+      </el-form-item>
       <el-row :gutter="24">
         <el-col :xs="24" :sm="12">
           <el-form-item label="定时全量同步到 Trakt（小时）">
@@ -285,7 +301,7 @@ onMounted(async () => {
       </el-row>
       <el-text type="info" size="small" class="trakt-note">
         已看记录和进度的全量同步可在“运行状态”页的 Trakt 卡片中手动执行；上面的间隔填 0 表示只手动执行，大于 0 时引擎启动后每隔该时长自动执行一次（不预览，直接执行）。
-        两个方向都只会补充，不会改为未看或删除记录。
+        全量同步两个方向都只会补充，不会改为未看或删除记录。
       </el-text>
       <div class="trakt-accounts">
         <el-button :icon="Plus" :disabled="!traktReady" @click="traktDialog = true">授权 Trakt 账户</el-button>

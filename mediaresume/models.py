@@ -58,6 +58,8 @@ class MediaItem:
     alt_keys: tuple[MediaKey, ...] = ()
     # 片长（毫秒），用于与 Trakt 的百分比进度换算；未知为 0
     duration_ms: int = 0
+    # 加入媒体库的时间（unix 秒），只有单条读取时才有，未知为 0
+    added_at: int = 0
 
 
 def merge_states(items: list[MediaItem]) -> WatchState:

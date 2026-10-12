@@ -12,6 +12,9 @@ export interface Config {
     client_id: string
     client_secret: string
     scrobble: boolean
+    sync_marks: boolean
+    sync_unwatch: boolean
+    unwatch_max: number
     push_interval: number
     pull_interval: number
   }
@@ -65,6 +68,8 @@ export interface Status {
 export interface TraktStatus {
   user: string
   pending: number
+  // 标记未看过多而暂停、等待确认删除观看记录的条目标题
+  held: string[]
   progress_pushed: number
   last_push: number | null
   busy: boolean
@@ -210,6 +215,8 @@ export const api = {
     request<{ pairs: (ResumePairBase & { counts?: Record<string, number> })[] }>('POST', '/api/trakt/sync/execute', {
       direction,
     }),
+  traktHeld: (user: string, action: 'confirm' | 'discard') =>
+    request<{ count: number }>('POST', '/api/trakt/held', { user, action }),
   traktDeleteAccount: (username: string) =>
     request<{ ok: boolean }>('DELETE', `/api/trakt/accounts/${encodeURIComponent(username)}`),
   logs: (after: number) => request<{ seq: number; logs: LogRecord[] }>('GET', `/api/logs?after=${after}`),
@@ -219,7 +226,7 @@ export function defaultConfig(): Config {
   return {
     plex: { url: 'http://127.0.0.1:32400', token: '' },
     emby: { url: 'http://127.0.0.1:8096', api_key: '' },
-    trakt: { client_id: '', client_secret: '', scrobble: true, push_interval: 0, pull_interval: 0 },
+    trakt: { client_id: '', client_secret: '', scrobble: true, sync_marks: true, sync_unwatch: false, unwatch_max: 10, push_interval: 0, pull_interval: 0 },
     mappings: [{ plex_user: null, emby_user: '', plex_token: null, trakt_user: null }],
     sync: { reconcile_interval: 900, poll_interval: 30, unwatch_poll_interval: 120, progress_interval: 60, echo_window: 10, dry_run: true },
     db_path: 'data/state.db',

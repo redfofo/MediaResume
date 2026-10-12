@@ -95,6 +95,8 @@ class SyncEngine:
         self.store = store
         # 未绑定 Trakt 账户时为 None
         self.trakt = trakt
+        if trakt:
+            trakt.on_history = self._trakt_history_added
         self._background: set[asyncio.Task] = set()
         self.pairs: list[Pair] = []
         # 所有同步操作在单个 worker 中串行执行，避免竞态
@@ -280,7 +282,10 @@ class SyncEngine:
                 continue
             for ep in episodes:
                 base = self.store.get(pair.id, ep.key)
-                if not ep.state.played and base is not None and base.played:
+                if ep.state.played or base is None:
+                    continue
+                # 已看被标记未看，或看到一半被清除进度（标记未看）
+                if base.played or (base.position_ms >= POSITION_TOLERANCE_MS and ep.state.position_ms == 0):
                     self.queue.put_nowait(("plex", pair, ep.item_id))
 
     # ---------- 从继续观看移除 ----------
@@ -534,10 +539,21 @@ class SyncEngine:
         playing = src == "plex" and self._is_playing(pair, item_id)
         # 一个文件包含多集时，对每一集分别同步
         for key in (src_item.key, *src_item.alt_keys):
+            # 同步会更新基准时间，要在同步前判断
+            readded = self._readded(pair, key, src_item)
             await self._sync_key(src, pair, replace(src_item, key=key, alt_keys=()))
             # Plex 正在播放时，Emby 侧的变化是我们同步过去的，不能当成“暂停”推给 Trakt
             live = src == "plex" or not any(self._is_playing(pair, i) for i in pair.plex_index.get(key, []))
-            self._observe(pair, key, src_item.state, src_item.title, src_item.duration_ms, playing, live)
+            self._observe(pair, key, src_item.state, src_item.title, src_item.duration_ms, playing, live, readded)
+
+    def _readded(self, pair: Pair, key: MediaKey, item: MediaItem) -> bool:
+        """之前记录为已看、现在显示未看的条目，是否在那之后才入库：删除后重新入库（重建媒体库、换文件生成新条目）
+        也显示为未看，但不是用户标记的。参考时间取基准最后写入时间与最后观看时间中较晚的；取不到入库时间时也视为是"""
+        before = pair.unified.get(key)
+        if not self.trakt or not pair.mapping.trakt_user or item.state.played or before is None or not before[0].played:
+            return False
+        ref = max(self.store.updated_at(pair.id, key) or 0, before[0].last_played)
+        return not item.added_at or not ref or item.added_at > ref
 
     async def _sync_key(self, src: str, pair: Pair, src_item: MediaItem) -> None:
         dst = "emby" if src == "plex" else "plex"
@@ -655,13 +671,23 @@ class SyncEngine:
         duration_ms: int = 0,
         playing: bool = False,
         live: bool = False,
+        readded: bool = False,
     ) -> None:
-        """记录统一状态供 Trakt 全量同步使用；实时事件中的状态推送到 Trakt"""
+        """记录统一状态供 Trakt 全量同步使用；实时事件中的状态推送到 Trakt，
+        与之前记录的状态相比是标记已看 / 未看、清除进度的，同步到 Trakt"""
         if not self.trakt or not pair.mapping.trakt_user:
             return
+        before = pair.unified.get(key)
         pair.unified[key] = (state, title, duration_ms)
         if live:
             self.trakt.observe_live(pair.mapping.trakt_user, key, state, duration_ms, title, playing)
+            if not playing:
+                self.trakt.observe_mark(pair.mapping.trakt_user, key, before[0] if before else None, state, title, readded)
+
+    def _trakt_history_added(self, username: str, items: dict[MediaKey, int]) -> None:
+        for pair in self.pairs:
+            if pair.mapping.trakt_user == username:
+                self.store.set_trakt_seen(pair.id, items)
 
     # ---------- Trakt 全量同步（手动） ----------
 
@@ -838,6 +864,8 @@ class SyncEngine:
                 continue
             if not self.cfg.sync.dry_run:
                 self.store.set(pair.id, key, target)
+                # 两端稍后的回传事件不能被当成本地标记已看，再推回 Trakt
+                self._observe(pair, key, target, (p_items + e_items)[0].title, _duration(p_items + e_items))
             n_watched += 1
         acc = self.trakt.accounts.get(pair.mapping.trakt_user)
         for key, (pct, paused_at) in progress.items():
@@ -860,6 +888,7 @@ class SyncEngine:
                 continue
             if not self.cfg.sync.dry_run:
                 self.store.set(pair.id, key, target)
+                self._observe(pair, key, target, items[0].title, duration)
             if acc:
                 # 写入后两端的回传事件不应再把同样的进度推回 Trakt
                 acc.progress_sent[key] = (pct, False)

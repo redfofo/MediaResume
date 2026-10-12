@@ -5,16 +5,16 @@ import json
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import aiohttp
 
 from . import __version__
 from .config import TraktConfig
-from .models import MediaKey, WatchState
+from .models import POSITION_TOLERANCE_MS, MediaKey, WatchState
 
 log = logging.getLogger("trakt")
 
@@ -38,6 +38,13 @@ PROGRESS_MIN, PROGRESS_MAX = 1.0, 80.0
 PROGRESS_STEP = 1.0
 # 列表接口的分页大小（Trakt 上限 250）与并发拉取的页数
 PAGE_LIMIT, PAGE_CONCURRENCY = 250, 8
+# 标记已看 / 清除进度延迟这么久（秒）再推送，期间改回（误点、开始重看）则取消
+MARK_DELAY = 60
+# scrobble 记录的观看时间由 Trakt 服务器决定，记为已见时多留这么多秒，容忍时钟偏差
+SEEN_MARGIN = 300
+# 统计标记未看数量的时间窗口（秒），超过 unwatch_max 部电影 / 剧时暂停删除，等待页面确认
+UNWATCH_WINDOW = 3600
+MARK_NAMES = {"watched": "标记已看", "clear": "清除进度", "unwatch": "标记未看（删除观看记录）"}
 
 
 class TraktAuthError(Exception):
@@ -234,6 +241,29 @@ class TraktClient:
     async def add_history(self, username: str, payload: dict) -> dict:
         return await self._user_request(username, "POST", "/sync/history", payload) or {}
 
+    async def trakt_id(self, kind: str, tmdb: str) -> Optional[int]:
+        """TMDB id -> Trakt id（kind 为 movie / show）；Trakt 不认识时返回 None"""
+        status, data = await self._raw("GET", f"/search/tmdb/{tmdb}?type={kind}")
+        if status != 200:
+            raise RuntimeError(_status_message(status))
+        for e in data or []:
+            if e.get("type") == kind:
+                return ((e.get(kind) or {}).get("ids") or {}).get("trakt")
+        return None
+
+    async def item_history(self, username: str, key: MediaKey) -> Optional[list[dict]]:
+        """该电影 / 单集在 Trakt 上的全部观看记录；Trakt 不认识该条目时返回 None"""
+        kind = "movie" if key.kind == "movie" else "show"
+        trakt_id = await self.trakt_id(kind, key.tmdb)
+        if trakt_id is None:
+            return None
+        # 剧集按整部剧查询（单集要再查一次 id），再按季 / 集筛选
+        entries = await self._user_pages(username, f"/sync/history/{kind}s/{trakt_id}")
+        return [e for e in entries if _entry_key(e) == key]
+
+    async def remove_history(self, username: str, history_ids: list[int]) -> dict:
+        return await self._user_request(username, "POST", "/sync/history/remove", {"ids": history_ids}) or {}
+
     async def playback(self, username: str) -> dict[MediaKey, "Playback"]:
         return parse_playback(await self._user_pages(username, "/sync/playback"))
 
@@ -242,6 +272,18 @@ class TraktClient:
 
     async def scrobble(self, username: str, action: str, key: MediaKey, progress: float) -> None:
         await self._user_request(username, "POST", f"/scrobble/{action}", scrobble_body(key, progress), ok=(409, 422))
+
+
+def _group(key: MediaKey) -> str:
+    """条目所属的电影 / 剧"""
+    return f"{key.kind}:{key.tmdb}" if key.kind == "movie" else f"show:{key.tmdb}"
+
+
+def _label(key: MediaKey, title: str) -> str:
+    """页面展示用：单集标题通常只有集名，附上季 / 集号"""
+    if key.kind == "episode":
+        return f"{title or key.tmdb} S{key.season:02d}E{key.episode:02d}"
+    return title or str(key)
 
 
 def _status_message(status: int) -> str:
@@ -378,6 +420,18 @@ class PushPlan:
     clear: dict[MediaKey, int] = field(default_factory=dict)  # 清除进度：Trakt playback id
 
 
+@dataclass(frozen=True)
+class Mark:
+    """待推送的标记：watched 补一条观看记录并清除进度，clear 只清除进度，unwatch 删除全部观看记录并清除进度"""
+
+    kind: str
+    state: WatchState
+    title: str
+    due: float  # time.monotonic()
+    # 标记未看：已在页面确认，不受数量上限限制
+    confirmed: bool = False
+
+
 @dataclass
 class TraktAccount:
     username: str
@@ -387,6 +441,12 @@ class TraktAccount:
     progress_sent: dict[MediaKey, tuple[float, bool]] = field(default_factory=dict)
     # 本次运行中已通过 stop 100% 记录观看的条目，避免回传事件重复记录
     scrobbled: set[MediaKey] = field(default_factory=set)
+    # 待推送的标记（在 Plex / Emby 中标记已看 / 未看、清除进度）
+    marks: dict[MediaKey, Mark] = field(default_factory=dict)
+    # 短时间内标记未看过多而暂停、等待页面确认的标记
+    held: dict[MediaKey, Mark] = field(default_factory=dict)
+    # 最近删除过观看记录的电影 / 剧 -> time.monotonic()，用于数量上限
+    unwatch_recent: dict[str, float] = field(default_factory=dict)
     progress_pushed: int = 0
     last_push: Optional[float] = None
     error: Optional[str] = None
@@ -398,14 +458,19 @@ class TraktAccount:
 
 
 class TraktSync:
-    """自动部分只有一件事：实时播放进度推送到 Trakt（scrobble）。
+    """自动部分：实时播放进度推送到 Trakt（scrobble），以及实时发现的标记已看 / 未看、清除进度。
     已看记录和进度的全量同步由页面手动或引擎定时触发：引擎生成计划，推送由 push_full 执行，拉回由引擎写入 Plex / Emby。"""
 
-    def __init__(self, client: TraktClient, cfg: TraktConfig, dry_run: bool):
+    def __init__(self, client: TraktClient, cfg: TraktConfig, dry_run: bool, removed_log: Optional[Path] = None):
         self.client = client
         self.cfg = cfg
         self.dry_run = dry_run
+        # 删除观看记录前追加备份到此文件（每行一个条目的原始观看记录），可据此恢复
+        self.removed_log = removed_log
         self.accounts: dict[str, TraktAccount] = {}
+        # 实时写入观看记录后回调 (Trakt 用户名, {MediaKey: 观看时间})，引擎据此记为已见：
+        # 之后在本地改为未看的，从 Trakt 全量同步时不会再被拉回已看
+        self.on_history: Optional[Callable[[str, dict[MediaKey, int]], None]] = None
 
     def add_account(self, username: str) -> None:
         self.accounts.setdefault(username, TraktAccount(username))
@@ -454,16 +519,79 @@ class TraktSync:
         acc.scrobbled.discard(key)  # 重看
         acc.pending[key] = (pct, "start" if playing else "stop", title)
 
+    def observe_mark(
+        self,
+        username: Optional[str],
+        key: MediaKey,
+        before: Optional[WatchState],
+        after: WatchState,
+        title: str = "",
+        readded: bool = False,
+    ) -> None:
+        """实时事件中的状态变化（before 为之前记录的统一状态）：未看 -> 已看，补一条观看记录；
+        有进度 -> 没有进度（清除进度），删除 Trakt 上的进度；已看 -> 未看，删除 Trakt 上的全部观看记录（需开启 sync_unwatch）。
+        readded：条目是在之前记录的状态之后才入库的（重新入库显示为未看，不是用户标记的），不删除观看记录。
+        延迟 MARK_DELAY 秒推送，期间状态又变了就取消"""
+        acc = self._account(username)
+        if acc is None or not (self.cfg.sync_marks or self.cfg.sync_unwatch):
+            return
+        for marks in (acc.marks, acc.held):
+            mark = marks.get(key)
+            if mark is not None and not after.same_as(mark.state):
+                del marks[key]
+                log.info("Trakt[%s] %s 状态又有变化，取消%s", acc.username, title or key, MARK_NAMES[mark.kind])
+        if before is None:
+            return
+        if after.played and not before.played:
+            if acc.pending.get(key, (0.0,))[0] >= 100:
+                return  # 实时进度推送已用 stop 100% 记录这次观看
+            kind, enabled = "watched", self.cfg.sync_marks
+        elif before.played and not after.played:
+            # 标记未看会清零进度；带进度的“未看”可能是重看到一半，不是标记未看
+            if after.position_ms:
+                return
+            kind, enabled = "unwatch", self.cfg.sync_unwatch
+            if enabled and readded:
+                log.info("Trakt[%s] %s 显示为未看，但条目是新入库的（疑似重新入库），不删除 Trakt 观看记录", acc.username, title or key)
+                return
+        elif not (after.played or before.played) and after.position_ms == 0 and before.position_ms >= POSITION_TOLERANCE_MS:
+            kind, enabled = "clear", self.cfg.sync_marks
+        else:
+            return
+        if enabled:
+            acc.marks[key] = Mark(kind, after, title, time.monotonic() + MARK_DELAY)
+
+    def release_held(self, username: str, confirm: bool) -> int:
+        """页面确认（confirm=True）或丢弃暂停的标记未看，返回条数"""
+        acc = self.accounts.get(username)
+        if acc is None:
+            raise ValueError(f"Trakt 账户 {username} 不在同步中")
+        held, acc.held = acc.held, {}
+        if confirm:
+            for key, mark in held.items():
+                acc.marks[key] = replace(mark, confirmed=True, due=0.0)
+            log.info("Trakt[%s] 已确认，删除 %d 个条目的观看记录", username, len(held))
+        else:
+            log.info("Trakt[%s] 已丢弃 %d 个待确认的标记未看，不删除观看记录", username, len(held))
+        return len(held)
+
     async def run(self) -> None:
         # 启动时检查一次授权，问题尽早显示在状态页
         for acc in self.accounts.values():
             await self._guard(acc, self.client.last_activities(acc.username))
         while True:
             await asyncio.sleep(FLUSH_INTERVAL)
-            now = time.monotonic()
             for acc in self.accounts.values():
-                if acc.pending and not acc.auth_failed and now >= acc.retry_at:
+                if acc.pending and self._ready(acc):
                     await self._guard(acc, self._push_live(acc))
+                now = time.monotonic()
+                due = {k: m for k, m in acc.marks.items() if m.due <= now}
+                if due and self._ready(acc):
+                    await self._guard(acc, self._push_marks(acc, due))
+
+    @staticmethod
+    def _ready(acc: TraktAccount) -> bool:
+        return not acc.auth_failed and time.monotonic() >= acc.retry_at
 
     async def _guard(self, acc: TraktAccount, coro) -> bool:
         try:
@@ -474,6 +602,8 @@ class TraktSync:
         except TraktAuthError as e:
             acc.error, acc.auth_failed = str(e), True
             acc.pending.clear()
+            acc.marks.clear()
+            acc.held.clear()
             log.error("%s", e)
         except Exception as e:
             acc.error = str(e) or e.__class__.__name__
@@ -502,8 +632,135 @@ class TraktSync:
             if pct >= 100:
                 acc.scrobbled.add(key)
                 acc.progress_sent.pop(key, None)
+                if not self.dry_run:
+                    self._history_added(acc, {key: int(time.time()) + SEEN_MARGIN})
             else:
                 acc.progress_sent[key] = (pct, action == "start")
+
+    def _history_added(self, acc: TraktAccount, items: dict[MediaKey, int]) -> None:
+        if self.on_history and items:
+            try:
+                self.on_history(acc.username, items)
+            except Exception as e:
+                log.warning("Trakt[%s] 记录已见的观看失败: %s", acc.username, str(e) or e.__class__.__name__)
+
+    # ---------- 实时标记 ----------
+
+    async def _push_marks(self, acc: TraktAccount, due: dict[MediaKey, Mark]) -> None:
+        for key in due:
+            acc.marks.pop(key, None)
+        # 完成的从 todo 中移除；失败时剩余的放回，等待重试（期间又有新标记的以新的为准）
+        todo = self._hold_bulk_unwatch(acc, due)
+        if not todo:
+            return
+        try:
+            await self._push_marks_todo(acc, todo)
+        except Exception:
+            for key, mark in todo.items():
+                acc.marks.setdefault(key, mark)
+            raise
+
+    def _hold_bulk_unwatch(self, acc: TraktAccount, due: dict[MediaKey, Mark]) -> dict[MediaKey, Mark]:
+        """短时间内大量条目被标记未看，多半是媒体库重建 / 重新扫描，而不是用户操作：暂停删除，等待页面确认。
+        按电影 / 剧计数，标记整季未看只算一部"""
+        unwatch = {k: m for k, m in due.items() if m.kind == "unwatch" and not m.confirmed}
+        if not unwatch:
+            return dict(due)
+        now = time.monotonic()
+        acc.unwatch_recent = {g: t for g, t in acc.unwatch_recent.items() if now - t < UNWATCH_WINDOW}
+        groups = {_group(k) for k in unwatch} | acc.unwatch_recent.keys()
+        if not acc.held and len(groups) <= self.cfg.unwatch_max:
+            return dict(due)
+        acc.held.update(unwatch)
+        log.warning(
+            "Trakt[%s] %d 分钟内有 %d 部电影 / 剧被标记未看（上限 %d），疑似媒体库异常，暂停删除 Trakt 观看记录，"
+            "共 %d 个条目等待在运行状态页确认",
+            acc.username, UNWATCH_WINDOW // 60, len(groups | {_group(k) for k in acc.held}), self.cfg.unwatch_max, len(acc.held),
+        )
+        return {k: m for k, m in due.items() if k not in unwatch}
+
+    def _backup_removed(self, user: str, found: dict[MediaKey, list[dict]], todo: dict[MediaKey, Mark]) -> None:
+        if self.removed_log is None:
+            return
+        self.removed_log.parent.mkdir(parents=True, exist_ok=True)
+        removed_at = _iso(int(time.time()))
+        with open(self.removed_log, "a", encoding="utf-8") as f:
+            for key, entries in found.items():
+                if entries:
+                    record = {"removed_at": removed_at, "user": user, "key": str(key), "title": todo[key].title, "history": entries}
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+    async def _push_marks_todo(self, acc: TraktAccount, todo: dict[MediaKey, Mark]) -> None:
+        user = acc.username
+        if self.dry_run:
+            for key, m in todo.items():
+                log.info("[dry-run] Trakt[%s] %s %s", user, MARK_NAMES[m.kind], m.title or key)
+            todo.clear()
+            return
+        unwatch = [k for k, m in todo.items() if m.kind == "unwatch"]
+        if unwatch:
+            found: dict[MediaKey, list[dict]] = {}
+            for key in unwatch:
+                entries = await self.client.item_history(user, key)
+                if entries is None:
+                    log.warning("Trakt[%s] 无法识别 %s 的 TMDB ID，跳过删除观看记录", user, todo[key].title or key)
+                found[key] = entries or []
+            history_ids = [e["id"] for entries in found.values() for e in entries]
+            if history_ids:
+                # 先备份再删除：备份失败时不删除
+                self._backup_removed(user, found, todo)
+                for i in range(0, len(history_ids), BATCH_SIZE):
+                    await self.client.remove_history(user, history_ids[i:i + BATCH_SIZE])
+            for key, entries in found.items():
+                # 观看记录已删除，重试时只需清除进度
+                todo[key] = replace(todo[key], kind="clear")
+                acc.scrobbled.discard(key)
+                acc.progress_sent.pop(key, None)
+                if not todo[key].confirmed:
+                    acc.unwatch_recent[_group(key)] = time.monotonic()
+                if entries:
+                    acc.progress_pushed += 1
+                    acc.last_push = time.time()
+                    log.info("Trakt[%s] 标记未看 %s：删除 %d 条观看记录", user, todo[key].title or key, len(entries))
+                else:
+                    log.debug("Trakt[%s] %s 在 Trakt 上没有观看记录", user, todo[key].title or key)
+        now = int(time.time())
+        # 没有观看时间时（部分客户端标记已看不更新）记为现在；不晚于现在，Trakt 不接受未来的观看
+        watched = {k: min(m.state.last_played, now) or now for k, m in todo.items() if m.kind == "watched"}
+        if watched:
+            resp = await self.client.add_history(user, history_payload(watched))
+            unknown_movies, unknown_shows = not_found_tmdb(resp)
+            recorded: dict[MediaKey, int] = {}
+            for key, ts in watched.items():
+                # 观看记录已写入，重试时只需清除进度，不能再补一次
+                todo[key] = replace(todo[key], kind="clear")
+                if key.tmdb in (unknown_movies if key.kind == "movie" else unknown_shows):
+                    continue
+                recorded[key] = ts
+                acc.scrobbled.add(key)
+                acc.progress_sent.pop(key, None)
+                log.info("Trakt[%s] 标记已看 %s", user, todo[key].title or key)
+            if unknown_movies or unknown_shows:
+                log.warning(
+                    "Trakt[%s] 无法识别以下 TMDB ID（电影 %s，剧 %s），已跳过",
+                    user, sorted(unknown_movies) or "-", sorted(unknown_shows) or "-",
+                )
+            acc.progress_pushed += len(recorded)
+            acc.last_push = time.time()
+            self._history_added(acc, recorded)
+        playback = await self.client.playback(user)
+        for key in list(todo):
+            pb = playback.get(key)
+            if pb is not None:
+                await self.client.remove_playback(user, pb.id)
+                if key not in watched and key not in unwatch:
+                    acc.progress_pushed += 1
+                    acc.last_push = time.time()
+                    log.info("Trakt[%s] 清除进度 %s（原 %.0f%%）", user, todo[key].title or key, pb.progress)
+            acc.progress_sent.pop(key, None)
+            del todo[key]
 
     # ---------- 手动全量推送 ----------
 
@@ -558,7 +815,8 @@ class TraktSync:
         return [
             {
                 "user": a.username,
-                "pending": len(a.pending),
+                "pending": len(a.pending) + len(a.marks),
+                "held": sorted(_label(k, m.title) for k, m in a.held.items()),
                 "progress_pushed": a.progress_pushed,
                 "last_push": a.last_push,
                 "busy": a.busy,

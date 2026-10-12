@@ -1,5 +1,7 @@
 import asyncio
+import json
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -8,14 +10,18 @@ from mediaresume.engine import Pair, SyncEngine
 from mediaresume.models import MediaItem, MediaKey, WatchState
 from mediaresume.store import StateStore
 from mediaresume.trakt import (
+    Mark,
     Playback,
     PushPlan,
     TraktAuthError,
+    TraktClient,
     TraktSync,
+    TraktTokenStore,
     history_payload,
     not_found_tmdb,
     parse_playback,
     parse_watched,
+    _parse_ts,
     scrobble_body,
 )
 
@@ -28,9 +34,12 @@ NOW = int(time.time())
 
 
 class FakeClient:
-    def __init__(self, watched=(), not_found=None, fail=None, playback=None):
+    def __init__(self, watched=(), not_found=None, fail=None, playback=None, history=None):
         self.remote = {k: NOW for k in watched}
         self.remote_playback = dict(playback or {})
+        # MediaKey -> 观看记录；不在其中的视为 Trakt 不认识
+        self.history = dict(history or {})
+        self.removed_history: list[int] = []
         self.not_found = not_found or {}
         self.fail = fail
         self.posts: list[dict] = []
@@ -65,6 +74,13 @@ class FakeClient:
     async def remove_playback(self, username, playback_id):
         self.removed.append(playback_id)
 
+    async def item_history(self, username, key):
+        return self.history.get(key)
+
+    async def remove_history(self, username, history_ids):
+        self.removed_history.extend(history_ids)
+        return {"deleted": {"movies": len(history_ids)}}
+
     async def scrobble(self, username, action, key, progress):
         if self.fail:
             raise self.fail
@@ -73,7 +89,7 @@ class FakeClient:
 
 
 def make(client, tmp_path, dry_run=False, **cfg):
-    sync = TraktSync(client, TraktConfig("id", "secret", **cfg), dry_run)
+    sync = TraktSync(client, TraktConfig("id", "secret", **cfg), dry_run, tmp_path / "data" / "trakt_removed.jsonl")
     sync.add_account("me")
     return sync, sync.accounts["me"]
 
@@ -240,6 +256,9 @@ class Server:
 
     async def mark_played(self, *args):
         self.ops.append(("played", args[0] if self.name == "plex" else args[1]))
+
+    async def mark_unplayed(self, *args):
+        self.ops.append(("unplayed", args[0] if self.name == "plex" else args[1]))
 
     async def set_position(self, *args):
         item_id, pos = (args[0], args[1]) if self.name == "plex" else (args[1], args[2])
@@ -586,3 +605,324 @@ def test_failed_pull_is_not_marked_seen(tmp_path):
     run(eng._trakt_pull(pair, {EP1: NOW, EP2: NOW}, {}, {EP1: NOW, EP2: NOW}))
     assert eng.plex.ops == [("played", "2")]
     assert eng.store.trakt_seen(pair.id) == {str(EP2): NOW}  # EP1 下次重试
+
+
+# ---------- 实时标记 ----------
+
+
+def unwatched():
+    return WatchState(False, 0, 0)
+
+
+def test_mark_watched_adds_history_and_clears_progress(tmp_path):
+    client = FakeClient(playback={MOVIE: Playback(7, 40.0, NOW)})
+    sync, acc = make(client, tmp_path)
+    seen = []
+    sync.on_history = lambda user, items: seen.append((user, items))
+    sync.observe_mark("me", MOVIE, progress(40)[0], played(NOW - 10), "Matrix")
+    mark = acc.marks[MOVIE]
+    assert mark.kind == "watched" and mark.due > time.monotonic() + 30  # 延迟推送
+    run(sync._push_marks(acc, dict(acc.marks)))
+    assert client.posts == [history_payload({MOVIE: NOW - 10})]
+    assert client.removed == [7]
+    assert seen == [("me", {MOVIE: NOW - 10})]
+    assert acc.marks == {} and MOVIE in acc.scrobbled and acc.progress_pushed == 1
+
+
+def test_mark_watched_without_time_uses_now(tmp_path):
+    client = FakeClient()
+    sync, acc = make(client, tmp_path)
+    sync.observe_mark("me", EP1, unwatched(), WatchState(True, 0, 0))
+    before = int(time.time())
+    run(sync._push_marks(acc, dict(acc.marks)))
+    ts = client.posts[0]["shows"][0]["seasons"][0]["episodes"][0]["watched_at"]
+    assert ts != "unknown" and _parse_ts(ts) >= before
+
+
+def test_mark_clear_progress(tmp_path):
+    client = FakeClient(playback={EP1: Playback(9, 55.0, NOW)})
+    sync, acc = make(client, tmp_path)
+    acc.progress_sent[EP1] = (55.0, False)
+    sync.observe_mark("me", EP1, progress(55)[0], unwatched())
+    assert acc.marks[EP1].kind == "clear"
+    run(sync._push_marks(acc, dict(acc.marks)))
+    assert client.posts == [] and client.removed == [9]
+    assert EP1 not in acc.progress_sent  # 之后再看到同样的进度仍会推送
+
+
+def test_mark_ignored_cases(tmp_path):
+    sync, acc = make(FakeClient(), tmp_path)
+    sync.observe_mark("me", MOVIE, None, played())  # 首次对账前，没有之前的状态
+    sync.observe_mark("me", MOVIE, played(), unwatched())  # 已看 -> 未看：不删除观看记录
+    sync.observe_mark("me", MOVIE, WatchState(False, 5_000, NOW), unwatched())  # 进度太小
+    sync.observe_mark("me", MOVIE, unwatched(), progress(30)[0])  # 只是进度变化
+    sync.observe_mark(None, MOVIE, unwatched(), played())
+    assert acc.marks == {}
+    # 实时进度推送已用 stop 100% 记录这次观看
+    acc.pending[EP1] = (100.0, "stop", "")
+    sync.observe_mark("me", EP1, progress(40)[0], played())
+    assert acc.marks == {}
+    off, off_acc = make(FakeClient(), tmp_path, sync_marks=False)
+    off.observe_mark("me", MOVIE, unwatched(), played())
+    assert off_acc.marks == {}
+
+
+def test_mark_cancelled_when_state_changes(tmp_path):
+    sync, acc = make(FakeClient(), tmp_path)
+    sync.observe_mark("me", MOVIE, unwatched(), played())
+    sync.observe_mark("me", MOVIE, played(), played())  # 另一端的回传事件
+    assert MOVIE in acc.marks
+    sync.observe_mark("me", MOVIE, played(), unwatched())  # 误点后改回
+    assert acc.marks == {}
+    sync.observe_mark("me", EP1, progress(40)[0], unwatched())
+    sync.observe_mark("me", EP1, unwatched(), progress(2)[0])  # 从头重看
+    assert acc.marks == {}
+
+
+class PlaybackFails(FakeClient):
+    async def playback(self, username):
+        if not self.playback_calls:
+            self.playback_calls += 1
+            raise RuntimeError("boom")
+        return await super().playback(username)
+
+
+def test_mark_retry_does_not_add_history_twice(tmp_path):
+    client = PlaybackFails(playback={MOVIE: Playback(7, 40.0, NOW)})
+    sync, acc = make(client, tmp_path)
+    sync.observe_mark("me", MOVIE, progress(40)[0], played())
+    assert not run(sync._guard(acc, sync._push_marks(acc, dict(acc.marks))))
+    assert acc.marks[MOVIE].kind == "clear"  # 观看记录已写入，只剩清除进度
+    run(sync._push_marks(acc, dict(acc.marks)))
+    assert len(client.posts) == 1 and client.removed == [7] and acc.marks == {}
+
+
+def test_mark_dry_run(tmp_path):
+    client = FakeClient(playback={MOVIE: Playback(7, 40.0, NOW)})
+    sync, acc = make(client, tmp_path, dry_run=True)
+    sync.observe_mark("me", MOVIE, progress(40)[0], played())
+    run(sync._push_marks(acc, dict(acc.marks)))
+    assert client.posts == client.removed == [] and acc.marks == {}
+
+
+def test_live_finish_records_seen(tmp_path):
+    sync, acc = make(FakeClient(), tmp_path)
+    seen = []
+    sync.on_history = lambda user, items: seen.append(items)
+    acc.progress_sent[EP1] = (40.0, False)
+    sync.observe_live("me", EP1, played(), 0)
+    run(sync._push_live(acc))
+    assert list(seen[0]) == [EP1] and seen[0][EP1] > time.time()
+
+
+def test_engine_mark_watched_and_seen(tmp_path):
+    p_item = MediaItem("plex", "1", MOVIE, WatchState(False, 1_200_000, NOW - 100), duration_ms=H)
+    e_item = MediaItem("emby", "a", MOVIE, WatchState(False, 1_200_000, NOW - 100), duration_ms=H)
+    client = FakeClient()
+    eng, pair, plex, emby, acc = make_engine(tmp_path, [p_item], [e_item], client=client)
+    run(eng._reconcile(pair))
+    assert acc.marks == {}
+    p_item.state = WatchState(True, 0, NOW - 5)
+    run(eng._handle_event("plex", pair, "1"))
+    assert emby.ops == [("played", "a")]
+    assert acc.marks[MOVIE].kind == "watched"
+    run(sync_marks(acc, eng))
+    assert client.posts == [history_payload({MOVIE: NOW - 5})]
+    # 之后在本地改为未看，从 Trakt 全量同步时不会拉回已看
+    assert eng.store.trakt_seen(pair.id) == {str(MOVIE): NOW - 5}
+
+
+def sync_marks(acc, eng):
+    return eng.trakt._push_marks(acc, dict(acc.marks))
+
+
+def test_engine_pull_echo_is_not_marked(tmp_path):
+    p_item = MediaItem("plex", "1", EP1, WatchState(False, 0))
+    e_item = MediaItem("emby", "a", EP1, WatchState(False, 0))
+    eng, pair, plex, emby, acc = make_engine(tmp_path, [p_item], [e_item])
+    run(eng._reconcile(pair))
+    run(eng._trakt_pull(pair, {EP1: 1_700_000_000}, {}))
+    # 拉回写入后，超过防回环窗口才轮询到的回传事件
+    eng._echo.clear()
+    e_item.state = played(1_700_000_000)
+    run(eng._handle_event("emby", pair, "a"))
+    assert acc.marks == {}
+
+
+# ---------- 标记未看：删除观看记录 ----------
+
+
+def plays(key, *ids):
+    entry = {"type": "movie", "movie": {"ids": {"tmdb": int(key.tmdb)}}} if key.kind == "movie" else {
+        "type": "episode",
+        "show": {"ids": {"tmdb": int(key.tmdb)}},
+        "episode": {"season": key.season, "number": key.episode},
+    }
+    return [{**entry, "id": i, "watched_at": "2024-01-01T00:00:00.000Z"} for i in ids]
+
+
+def due_now(acc):
+    return {k: m for k, m in acc.marks.items()}
+
+
+def test_unwatch_removes_history_after_backup(tmp_path):
+    client = FakeClient(history={MOVIE: plays(MOVIE, 11, 12)}, playback={MOVIE: Playback(7, 5.0, NOW)})
+    sync, acc = make(client, tmp_path, sync_unwatch=True)
+    acc.scrobbled.add(MOVIE)
+    sync.observe_mark("me", MOVIE, played(), unwatched(), "Matrix")
+    assert acc.marks[MOVIE].kind == "unwatch"
+    run(sync._push_marks(acc, due_now(acc)))
+    assert client.removed_history == [11, 12] and client.removed == [7]
+    assert MOVIE not in acc.scrobbled  # 之后再看完仍会记录
+    lines = (tmp_path / "data" / "trakt_removed.jsonl").read_text(encoding="utf-8").splitlines()
+    record = json.loads(lines[0])
+    assert record["key"] == str(MOVIE) and record["title"] == "Matrix" and [e["id"] for e in record["history"]] == [11, 12]
+
+
+def test_unwatch_disabled_or_readded(tmp_path):
+    sync, acc = make(FakeClient(), tmp_path)  # 默认关闭
+    sync.observe_mark("me", MOVIE, played(), unwatched())
+    assert acc.marks == {}
+    sync, acc = make(FakeClient(), tmp_path, sync_unwatch=True)
+    sync.observe_mark("me", MOVIE, played(), unwatched(), readded=True)
+    assert acc.marks == {}
+    sync.observe_mark("me", MOVIE, played(), progress(30)[0])  # 重看到一半，不是标记未看
+    assert acc.marks == {}
+    # 只开删除观看记录时，标记已看不推送
+    sync, acc = make(FakeClient(), tmp_path, sync_marks=False, sync_unwatch=True)
+    sync.observe_mark("me", MOVIE, unwatched(), played())
+    assert acc.marks == {}
+
+
+def test_unwatch_backup_failure_removes_nothing(tmp_path):
+    client = FakeClient(history={MOVIE: plays(MOVIE, 11)})
+    sync, acc = make(client, tmp_path, sync_unwatch=True)
+    sync.removed_log = tmp_path  # 是目录，写入失败
+    sync.observe_mark("me", MOVIE, played(), unwatched())
+    assert not run(sync._guard(acc, sync._push_marks(acc, due_now(acc))))
+    assert client.removed_history == [] and acc.marks[MOVIE].kind == "unwatch"
+
+
+def test_unwatch_unknown_item_only_clears_progress(tmp_path):
+    client = FakeClient(playback={MOVIE: Playback(7, 5.0, NOW)})
+    sync, acc = make(client, tmp_path, sync_unwatch=True)
+    sync.observe_mark("me", MOVIE, played(), unwatched())
+    run(sync._push_marks(acc, due_now(acc)))
+    assert client.removed_history == [] and client.removed == [7] and acc.marks == {}
+    assert not (tmp_path / "data" / "trakt_removed.jsonl").exists()
+
+
+def test_unwatch_retry_after_removal_only_clears_progress(tmp_path):
+    client = PlaybackFails(history={MOVIE: plays(MOVIE, 11)}, playback={MOVIE: Playback(7, 5.0, NOW)})
+    sync, acc = make(client, tmp_path, sync_unwatch=True)
+    sync.observe_mark("me", MOVIE, played(), unwatched())
+    assert not run(sync._guard(acc, sync._push_marks(acc, due_now(acc))))
+    assert acc.marks[MOVIE].kind == "clear"
+    run(sync._push_marks(acc, due_now(acc)))
+    assert client.removed_history == [11] and client.removed == [7]
+
+
+def test_unwatch_bulk_is_held_until_confirmed(tmp_path):
+    movies = [MediaKey("movie", str(i)) for i in (1, 2, 3)]
+    client = FakeClient(history={k: plays(k, int(k.tmdb)) for k in movies})
+    sync, acc = make(client, tmp_path, sync_unwatch=True, unwatch_max=2)
+    for k in movies:
+        sync.observe_mark("me", k, played(), unwatched(), f"M{k.tmdb}")
+    run(sync._push_marks(acc, due_now(acc)))
+    assert client.removed_history == [] and set(acc.held) == set(movies)
+    assert client.playback_calls == 0
+    assert sync.status()[0]["held"] == ["M1", "M2", "M3"]
+    acc.held[EP1] = Mark("unwatch", unwatched(), "Pilot", 0)
+    assert "Pilot S01E01" in sync.status()[0]["held"]
+    del acc.held[EP1]
+    # 暂停期间又标记的也一并暂停；改回已看的取消
+    extra = MediaKey("movie", "4")
+    sync.observe_mark("me", extra, played(), unwatched())
+    run(sync._push_marks(acc, due_now(acc)))
+    sync.observe_mark("me", extra, unwatched(), played())
+    assert extra not in acc.held
+    assert sync.release_held("me", confirm=True) == 3
+    assert acc.held == {} and all(acc.marks[k].confirmed and acc.marks[k].due == 0 for k in movies)
+    assert acc.marks[extra].kind == "watched"  # 改回已看按标记已看处理
+    run(sync._push_marks(acc, due_now(acc)))
+    assert sorted(client.removed_history) == [1, 2, 3]
+    # 确认执行的不计入数量上限
+    assert acc.unwatch_recent == {}
+
+
+def test_unwatch_discard_held(tmp_path):
+    client = FakeClient(history={MOVIE: plays(MOVIE, 11)})
+    sync, acc = make(client, tmp_path, sync_unwatch=True, unwatch_max=1)
+    acc.unwatch_recent["movie:1"] = time.monotonic()  # 1 小时内已删除过一部
+    sync.observe_mark("me", MOVIE, played(), unwatched())
+    run(sync._push_marks(acc, due_now(acc)))
+    assert MOVIE in acc.held
+    assert sync.release_held("me", confirm=False) == 1
+    assert acc.held == {} and acc.marks == {} and client.removed_history == []
+
+
+def test_unwatch_limit_counts_shows_not_episodes(tmp_path):
+    eps = [EP1, EP2, EP3, EP4]
+    client = FakeClient(history={k: plays(k, k.episode) for k in eps})
+    sync, acc = make(client, tmp_path, sync_unwatch=True, unwatch_max=1)
+    for k in eps:  # 标记整季未看
+        sync.observe_mark("me", k, played(), unwatched())
+    run(sync._push_marks(acc, due_now(acc)))
+    assert acc.held == {} and sorted(client.removed_history) == [1, 2, 3, 4]
+
+
+def test_unwatch_dry_run(tmp_path):
+    client = FakeClient(history={MOVIE: plays(MOVIE, 11)})
+    sync, acc = make(client, tmp_path, dry_run=True, sync_unwatch=True)
+    sync.observe_mark("me", MOVIE, played(), unwatched())
+    run(sync._push_marks(acc, due_now(acc)))
+    assert client.removed_history == [] and acc.marks == {}
+
+
+def test_client_item_history_filters_episode(tmp_path):
+    client = TraktClient(None, TraktConfig("id"), TraktTokenStore(tmp_path / "t.json"))
+    calls = []
+
+    async def trakt_id(kind, tmdb):
+        calls.append((kind, tmdb))
+        return 42
+
+    async def pages(username, path):
+        calls.append(path)
+        return plays(EP1, 1) + plays(EP2, 2)
+
+    client.trakt_id, client._user_pages = trakt_id, pages
+    assert [e["id"] for e in run(client.item_history("me", EP1))] == [1]
+    assert calls == [("show", "1399"), "/sync/history/shows/42"]
+
+
+def test_engine_readded_detection(tmp_path):
+    item = MediaItem("plex", "1", MOVIE, WatchState(False, 0), added_at=NOW - 86_400)
+    eng, pair, *_ = make_engine(tmp_path, [item], [])
+    pair.unified[MOVIE] = (played(NOW - 3_600), "", 0)
+    assert not eng._readded(pair, MOVIE, item)  # 入库后才看的
+    assert eng._readded(pair, MOVIE, replace(item, added_at=NOW))  # 看过之后重新入库
+    assert eng._readded(pair, MOVIE, replace(item, added_at=0))  # 入库时间未知
+    # 基准在入库之后写入（如 Emby 晚于 Plex 加入、按原观看时间同步为已看），以基准时间为准
+    eng.store.set(pair.id, MOVIE, played(NOW - 10 * 86_400))
+    assert not eng._readded(pair, MOVIE, replace(item, added_at=NOW - 3 * 86_400))
+
+
+def test_engine_unwatch_event(tmp_path):
+    p_item = MediaItem("plex", "1", MOVIE, played(NOW - 3_600), added_at=NOW - 86_400)
+    e_item = MediaItem("emby", "a", MOVIE, played(NOW - 3_600))
+    eng, pair, plex, emby, acc = make_engine(tmp_path, [p_item], [e_item])
+    eng.trakt.cfg.sync_unwatch = True
+    run(eng._reconcile(pair))
+    p_item.state = unwatched()
+    run(eng._handle_event("plex", pair, "1"))
+    assert emby.ops == [("unplayed", "a")]
+    assert acc.marks[MOVIE].kind == "unwatch"
+
+
+def test_config_unwatch_defaults_and_validation():
+    base = {"plex": {"url": "http://p", "token": "t"}, "emby": {"url": "http://e", "api_key": "k"}, "mappings": [{"emby_user": "u"}]}
+    cfg = parse_config(base)
+    assert cfg.trakt.sync_marks and not cfg.trakt.sync_unwatch and cfg.trakt.unwatch_max == 10
+    with pytest.raises(ValueError):
+        parse_config({**base, "trakt": {"unwatch_max": 0}})
