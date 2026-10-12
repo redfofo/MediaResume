@@ -326,6 +326,10 @@ class PlexClient:
         await self._get("/:/unscrobble", {"key": rating_key, "identifier": IDENTIFIER}, token)
 
     async def set_position(self, rating_key: str, position_ms: int, token: Optional[str] = None) -> None:
+        if position_ms <= 0:
+            # Plex 静默忽略 time=0 的进度上报，原进度不变；只有 unscrobble 能清除进度（调用方仅在目标为未看时写进度）
+            await self.mark_unplayed(rating_key, token)
+            return
         params = {"key": rating_key, "identifier": IDENTIFIER, "time": position_ms, "state": "stopped"}
         await self._get("/:/progress", params, token)
 

@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { ElMessage } from 'element-plus'
-import { Download, Refresh, RefreshRight, Switch, Upload } from '@element-plus/icons-vue'
+import { Download, Refresh, RefreshRight, SortDown, SortUp, Switch, Upload } from '@element-plus/icons-vue'
 import { api, type LogRecord, type Status, type TraktDirection } from '../api'
 import ResumeSyncDialog from './ResumeSyncDialog.vue'
 import TraktSyncDialog from './TraktSyncDialog.vue'
@@ -11,6 +11,9 @@ const emit = defineEmits<{ refresh: [] }>()
 
 const logs = ref<LogRecord[]>([])
 const autoScroll = ref(true)
+// 倒序时最新日志在最上方；记住选择，刷新页面后保持
+const newestFirst = ref(localStorage.getItem('logOrder') === 'desc')
+const shownLogs = computed(() => (newestFirst.value ? [...logs.value].reverse() : logs.value))
 const logBox = ref<HTMLElement>()
 const busy = ref(false)
 const resumeDialog = ref(false)
@@ -30,14 +33,21 @@ async function pollLogs() {
     if (!data.logs.length) return
     lastSeq = data.seq
     logs.value = [...logs.value, ...data.logs].slice(-500)
-    if (autoScroll.value) {
-      await nextTick()
-      logBox.value?.scrollTo({ top: logBox.value.scrollHeight })
-    }
+    if (autoScroll.value) await scrollToNewest()
   } catch {
     /* 后端不可用时静默 */
   }
 }
+
+async function scrollToNewest() {
+  await nextTick()
+  logBox.value?.scrollTo({ top: newestFirst.value ? 0 : logBox.value.scrollHeight })
+}
+
+watch(newestFirst, (desc) => {
+  localStorage.setItem('logOrder', desc ? 'desc' : 'asc')
+  scrollToNewest()
+})
 
 async function run(action: 'reconcile' | 'restart') {
   busy.value = true
@@ -192,11 +202,20 @@ onUnmounted(() => window.clearInterval(timer))
       <template #header>
         <div class="card-header">
           <span>日志</span>
-          <el-checkbox v-model="autoScroll">自动滚动</el-checkbox>
+          <div class="log-tools">
+            <el-button
+              size="small"
+              :icon="newestFirst ? SortDown : SortUp"
+              @click="newestFirst = !newestFirst"
+            >
+              {{ newestFirst ? '倒序（最新在上）' : '正序（最新在下）' }}
+            </el-button>
+            <el-checkbox v-model="autoScroll">自动滚动</el-checkbox>
+          </div>
         </div>
       </template>
       <div ref="logBox" class="logs">
-        <div v-for="l in logs" :key="l.seq" class="log-line">
+        <div v-for="l in shownLogs" :key="l.seq" class="log-line">
           <span class="log-time">{{ fmtTime(l.time) }}</span>
           <el-tag :type="levelType(l.level)" size="small" disable-transitions>{{ l.level }}</el-tag>
           <span class="log-name">{{ l.name }}</span>
@@ -231,6 +250,11 @@ onUnmounted(() => window.clearInterval(timer))
   align-items: center;
   flex-wrap: wrap;
   gap: 8px;
+}
+.log-tools {
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 .logs {
   height: 360px;
