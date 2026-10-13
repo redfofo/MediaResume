@@ -286,7 +286,7 @@ onUnmounted(() => window.clearInterval(timer))
       <div ref="logBox" class="logs">
         <div v-for="l in shownLogs" :key="l.seq" class="log-line">
           <span class="log-time">{{ fmtTime(l.time) }}</span>
-          <el-tag :type="levelType(l.level)" size="small" disable-transitions>{{ l.level }}</el-tag>
+          <el-tag :type="levelType(l.level)" size="small" class="log-level" disable-transitions>{{ l.level }}</el-tag>
           <span class="log-name">{{ l.name }}</span>
           <span class="log-msg">{{ l.message }}</span>
         </div>
@@ -311,6 +311,7 @@ onUnmounted(() => window.clearInterval(timer))
 .stat .label {
   color: var(--el-text-color-secondary);
   font-size: 13px;
+  line-height: 20px;
   margin-bottom: 8px;
 }
 .card-header {
@@ -348,6 +349,10 @@ onUnmounted(() => window.clearInterval(timer))
 }
 .log-time {
   color: var(--el-text-color-secondary);
+}
+.log-level {
+  flex: none;
+  width: 64px;
 }
 .log-name {
   color: var(--el-color-primary);
