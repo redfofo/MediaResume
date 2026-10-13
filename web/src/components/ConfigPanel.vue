@@ -183,9 +183,18 @@ onMounted(async () => {
         :closable="false"
         class="hint"
       />
-      <el-table :data="cfg.mappings">
-        <el-table-column label="Plex 用户" min-width="200">
-          <template #default="{ row }">
+      <!-- 宽屏按列排布，窄屏每条映射一张卡片 -->
+      <div class="mappings">
+        <div class="mapping mapping-head">
+          <span>Plex 用户</span>
+          <span>Plex 用户 Token</span>
+          <span>Emby 用户</span>
+          <span>Trakt 账户</span>
+          <span />
+        </div>
+        <div v-for="(row, i) in cfg.mappings" :key="i" class="mapping">
+          <div class="field">
+            <span class="field-label">Plex 用户</span>
             <el-select
               v-model="row.plex_user"
               clearable
@@ -195,10 +204,9 @@ onMounted(async () => {
             >
               <el-option v-for="a in plexAccounts" :key="a.id" :label="a.name" :value="a.name" />
             </el-select>
-          </template>
-        </el-table-column>
-        <el-table-column label="Plex 用户 Token" min-width="200">
-          <template #default="{ row }">
+          </div>
+          <div class="field">
+            <span class="field-label">Plex 用户 Token</span>
             <el-input
               v-if="row.plex_user"
               v-model="row.plex_token"
@@ -207,34 +215,29 @@ onMounted(async () => {
               placeholder="该用户自己的 token"
             />
             <el-text v-else type="info">使用所有者 Token</el-text>
-          </template>
-        </el-table-column>
-        <el-table-column label="Emby 用户" min-width="200">
-          <template #default="{ row }">
+          </div>
+          <div class="field">
+            <span class="field-label">Emby 用户</span>
             <el-select v-model="row.emby_user" filterable allow-create placeholder="选择 Emby 用户">
               <el-option v-for="u in embyUsers" :key="u.id" :label="u.name" :value="u.id" />
             </el-select>
-          </template>
-        </el-table-column>
-        <el-table-column label="Trakt 账户" min-width="160">
-          <template #default="{ row }">
+          </div>
+          <div class="field">
+            <span class="field-label">Trakt 账户</span>
             <el-select v-model="row.trakt_user" clearable placeholder="不同步到 Trakt">
               <el-option v-for="u in traktAccounts" :key="u" :label="u" :value="u" />
             </el-select>
-          </template>
-        </el-table-column>
-        <el-table-column width="70" align="center">
-          <template #default="{ $index }">
-            <el-button
-              :icon="Delete"
-              type="danger"
-              text
-              :disabled="cfg.mappings.length <= 1"
-              @click="cfg.mappings.splice($index, 1)"
-            />
-          </template>
-        </el-table-column>
-      </el-table>
+          </div>
+          <el-button
+            class="mapping-delete"
+            :icon="Delete"
+            type="danger"
+            text
+            :disabled="cfg.mappings.length <= 1"
+            @click="cfg.mappings.splice(i, 1)"
+          />
+        </div>
+      </div>
     </el-card>
 
     <el-card shadow="never">
@@ -413,5 +416,64 @@ onMounted(async () => {
 .actions {
   display: flex;
   justify-content: flex-end;
+}
+.mapping {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(0, 0.8fr) 48px;
+  gap: 12px;
+  align-items: center;
+  padding: 12px 0;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+}
+.mapping-head {
+  padding-top: 0;
+  color: var(--el-text-color-secondary);
+  font-size: 14px;
+  font-weight: 600;
+}
+.field-label {
+  display: none;
+}
+.mapping-delete {
+  justify-self: center;
+}
+@media (max-width: 767px) {
+  .mapping-head {
+    display: none;
+  }
+  .mapping {
+    position: relative;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+  .mapping-head + .mapping {
+    padding-top: 0;
+  }
+  .mapping:last-child {
+    border-bottom: none;
+    padding-bottom: 0;
+  }
+  .field-label {
+    display: block;
+    margin-bottom: 4px;
+    color: var(--el-text-color-regular);
+    font-size: 14px;
+  }
+  .mapping-delete {
+    position: absolute;
+    top: 12px;
+    right: 0;
+  }
+  .mapping-head + .mapping .mapping-delete {
+    top: 0;
+  }
+  .switch-hint {
+    flex-basis: 100%;
+    margin: 4px 0 0;
+    line-height: 1.6;
+  }
+  .actions .el-button {
+    width: 100%;
+  }
 }
 </style>

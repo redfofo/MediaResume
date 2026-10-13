@@ -97,7 +97,7 @@ watch(visible, (v) => {
 </script>
 
 <template>
-  <el-dialog v-model="visible" title="授权 Trakt 账户" width="420px" align-center>
+  <el-dialog v-model="visible" title="授权 Trakt 账户" width="min(420px, 94vw)" align-center>
     <div v-loading="loading" class="body">
       <el-alert v-if="error" :title="error" type="error" :closable="false" show-icon />
       <template v-if="code?.user_code">

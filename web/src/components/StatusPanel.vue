@@ -1,8 +1,8 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
+import { computed, h, nextTick, onMounted, onUnmounted, ref, watch, type VNode } from 'vue'
+import { ElMessage, ElTag, ElText } from 'element-plus'
 import { Download, Refresh, RefreshRight, SortDown, SortUp, Switch, Upload } from '@element-plus/icons-vue'
-import { api, type LogRecord, type Status, type TraktDirection } from '../api'
+import { api, type LogRecord, type ReconcileStats, type Status, type TraktDirection, type TraktStatus } from '../api'
 import ResumeSyncDialog from './ResumeSyncDialog.vue'
 import TraktSyncDialog from './TraktSyncDialog.vue'
 
@@ -77,6 +77,32 @@ const fmtClock = (ts: number) => new Date(ts * 1000).toLocaleTimeString()
 const levelType = (l: string) =>
   l === 'ERROR' || l === 'CRITICAL' ? 'danger' : l === 'WARNING' ? 'warning' : 'info'
 
+// 表格（宽屏）和卡片列表（窄屏）共用的单元格内容
+const NOWRAP = { whiteSpace: 'nowrap' }
+const ReconcileResult = (props: { stats?: ReconcileStats | null }) => {
+  const r = props.stats
+  if (!r) return h('span', '等待首次对账')
+  if (r.error) return h(ElText, { type: 'danger' }, () => r.error)
+  // 每一项整体换行，分隔点留在行尾
+  const items = [`Plex ${r.plex}`, `Emby ${r.emby}`, `匹配 ${r.matched}`, `同步 ${r.changed}`, `${r.seconds}s`]
+  const parts: (VNode | string)[] = items.flatMap((t, i) =>
+    i < items.length - 1 || r.failed ? [h('span', { style: NOWRAP }, `${t} ·`), ' '] : [h('span', { style: NOWRAP }, t)],
+  )
+  if (r.failed) parts.push(h(ElText, { type: 'danger', style: NOWRAP }, () => `失败 ${r.failed}（详见日志）`))
+  return h('span', parts)
+}
+ReconcileResult.props = ['stats']
+
+const TraktState = (props: { account: TraktStatus }) => {
+  const a = props.account
+  if (a.error) return h(ElText, { type: 'danger' }, () => a.error)
+  return h('span', [
+    a.busy ? h(ElTag, { type: 'warning', size: 'small' }, () => '全量同步中') : null,
+    ` 本次运行实时推送 ${a.progress_pushed} 次 · 待推送 ${a.pending}`,
+  ])
+}
+TraktState.props = ['account']
+
 onMounted(() => {
   pollLogs()
   timer = window.setInterval(pollLogs, 2000)
@@ -131,7 +157,7 @@ onUnmounted(() => window.clearInterval(timer))
       <template #header>
         <div class="card-header">
           <span>用户映射</span>
-          <div>
+          <div class="actions">
             <el-button :icon="Refresh" :loading="busy" :disabled="!status.running" @click="run('reconcile')">
               立即对账
             </el-button>
@@ -144,7 +170,7 @@ onUnmounted(() => window.clearInterval(timer))
           </div>
         </div>
       </template>
-      <el-table :data="status.pairs" empty-text="引擎未运行">
+      <el-table :data="status.pairs" empty-text="引擎未运行" class="wide-only">
         <el-table-column label="Plex 用户" min-width="120">
           <template #default="{ row }">{{ row.plex_user || '服务器所有者' }}</template>
         </el-table-column>
@@ -157,23 +183,34 @@ onUnmounted(() => window.clearInterval(timer))
         </el-table-column>
         <el-table-column label="结果" min-width="260">
           <template #default="{ row }">
-            <span v-if="!row.reconcile">等待首次对账</span>
-            <el-text v-else-if="row.reconcile.error" type="danger">{{ row.reconcile.error }}</el-text>
-            <span v-else>
-              Plex {{ row.reconcile.plex }} · Emby {{ row.reconcile.emby }} · 匹配 {{ row.reconcile.matched }} ·
-              同步 {{ row.reconcile.changed }} · {{ row.reconcile.seconds }}s
-              <el-text v-if="row.reconcile.failed" type="danger">· 失败 {{ row.reconcile.failed }}（详见日志）</el-text>
-            </span>
+            <ReconcileResult :stats="row.reconcile" />
           </template>
         </el-table-column>
       </el-table>
+      <div class="narrow-only">
+        <el-empty v-if="!status.pairs.length" description="引擎未运行" :image-size="60" />
+        <div v-for="row in status.pairs" :key="row.id" class="item">
+          <div class="item-title">
+            {{ row.plex_user || '服务器所有者' }} ⇄ {{ row.emby_user }}
+            <template v-if="status.trakt.length">→ Trakt {{ row.trakt_user || '—' }}</template>
+          </div>
+          <div class="item-row">
+            <span class="item-label">最近对账</span>
+            <span>{{ row.reconcile ? fmtTime(row.reconcile.at) : '—' }}</span>
+          </div>
+          <div class="item-row">
+            <span class="item-label">结果</span>
+            <ReconcileResult :stats="row.reconcile" />
+          </div>
+        </div>
+      </div>
     </el-card>
 
     <el-card v-if="status.trakt.length" shadow="never">
       <template #header>
         <div class="card-header">
           <span>Trakt</span>
-          <div>
+          <div class="actions">
             <el-button :icon="Upload" :disabled="!status.running" @click="openTrakt('to_trakt')">
               全量同步到 Trakt
             </el-button>
@@ -204,21 +241,30 @@ onUnmounted(() => window.clearInterval(timer))
         <el-button size="small" type="danger" @click="releaseHeld(acc.user, 'confirm')">确认删除</el-button>
         <el-button size="small" @click="releaseHeld(acc.user, 'discard')">丢弃，不删除</el-button>
       </el-alert>
-      <el-table :data="status.trakt">
+      <el-table :data="status.trakt" class="wide-only">
         <el-table-column prop="user" label="账户" min-width="120" />
         <el-table-column label="最近推送" min-width="170">
           <template #default="{ row }">{{ row.last_push ? fmtTime(row.last_push) : '—' }}</template>
         </el-table-column>
         <el-table-column label="状态" min-width="280">
           <template #default="{ row }">
-            <el-text v-if="row.error" type="danger">{{ row.error }}</el-text>
-            <span v-else>
-              <el-tag v-if="row.busy" type="warning" size="small">全量同步中</el-tag>
-              本次运行实时推送 {{ row.progress_pushed }} 次 · 待推送 {{ row.pending }}
-            </span>
+            <TraktState :account="row" />
           </template>
         </el-table-column>
       </el-table>
+      <div class="narrow-only">
+        <div v-for="row in status.trakt" :key="row.user" class="item">
+          <div class="item-title">{{ row.user }}</div>
+          <div class="item-row">
+            <span class="item-label">最近推送</span>
+            <span>{{ row.last_push ? fmtTime(row.last_push) : '—' }}</span>
+          </div>
+          <div class="item-row">
+            <span class="item-label">状态</span>
+            <TraktState :account="row" />
+          </div>
+        </div>
+      </div>
     </el-card>
 
     <el-card shadow="never">
@@ -274,6 +320,14 @@ onUnmounted(() => window.clearInterval(timer))
   flex-wrap: wrap;
   gap: 8px;
 }
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.actions .el-button {
+  margin-left: 0;
+}
 .log-tools {
   display: flex;
   align-items: center;
@@ -287,7 +341,7 @@ onUnmounted(() => window.clearInterval(timer))
 }
 .log-line {
   display: flex;
-  align-items: center;
+  align-items: baseline;
   gap: 8px;
   padding: 2px 0;
   white-space: nowrap;
@@ -300,8 +354,72 @@ onUnmounted(() => window.clearInterval(timer))
   min-width: 48px;
 }
 .log-msg {
+  flex: 1;
+  min-width: 0;
   white-space: pre-wrap;
   word-break: break-all;
+}
+.narrow-only {
+  display: none;
+}
+.item {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--el-border-color-lighter);
+  font-size: 14px;
+}
+.item:first-child {
+  padding-top: 0;
+}
+.item:last-child {
+  border-bottom: none;
+  padding-bottom: 0;
+}
+.item-title {
+  font-weight: 600;
+  margin-bottom: 6px;
+  word-break: break-all;
+}
+.item-row {
+  display: flex;
+  gap: 12px;
+  line-height: 1.6;
+}
+.item-label {
+  flex: none;
+  width: 4em;
+  color: var(--el-text-color-secondary);
+}
+.item-row > :last-child {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+@media (max-width: 767px) {
+  .actions {
+    flex-basis: 100%;
+  }
+  .actions .el-button {
+    flex: 1 1 auto;
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+  .logs {
+    height: 60vh;
+  }
+  .wide-only {
+    display: none;
+  }
+  .narrow-only {
+    display: block;
+  }
+  .log-line {
+    flex-wrap: wrap;
+    gap: 2px 8px;
+    padding: 6px 0;
+    border-bottom: 1px solid var(--el-border-color-lighter);
+  }
+  .log-msg {
+    flex-basis: 100%;
+  }
 }
 .trakt-held {
   margin-bottom: 8px;

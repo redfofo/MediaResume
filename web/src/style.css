@@ -4,3 +4,9 @@ html, body {
   color: var(--el-text-color-primary);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
 }
+
+@media (max-width: 767px) {
+  .el-card {
+    --el-card-padding: 14px;
+  }
+}
