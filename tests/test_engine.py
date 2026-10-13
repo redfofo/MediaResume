@@ -277,3 +277,12 @@ def test_trakt_timer_first_start_records_baseline(tmp_path):
     run(main())
     assert calls == [] and eng.store.meta_get("trakt_last_from_trakt") is not None
     assert abs(eng.trakt_next["from_trakt"] - (time.time() + 3600)) < 5
+
+
+def test_pair_label_is_short_and_id_unchanged():
+    guid = "b0f3bd52284f4e21bee729e7a73df4b5"
+    pair = Pair(Mapping("火火", "dlwlrma"), "t", guid, "dlwlrma")
+    assert pair.label == "火火⇄dlwlrma"
+    # id 是状态库的键，不能变
+    assert pair.id == f"火火|{guid}"
+    assert Pair(Mapping(None, "u"), "t", guid).label == "所有者⇄b0f3bd52"
