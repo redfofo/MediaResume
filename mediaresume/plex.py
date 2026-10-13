@@ -13,6 +13,8 @@ from .models import MediaItem, MediaKey, WatchState, parse_tmdb, tmdb_from_path
 log = logging.getLogger("plex")
 
 PAGE_SIZE = 1000
+# 单个资料库读取时最多跳过的出错条目数，超过视为服务器故障
+MAX_SKIPPED_ITEMS = 20
 IDENTIFIER = "com.plexapp.plugins.library"
 # 轮询时去掉用不到的字段，减小响应体
 SLIM = {
@@ -143,22 +145,59 @@ class PlexClient:
             show_tmdb = await self._show_tmdb_id(str(meta.get("grandparentRatingKey")))
         return self._to_item(meta, show_tmdb)
 
+    async def _list_page(
+        self, section: str, type_id: int, token: Optional[str], slim: dict, start: int, size: int
+    ) -> tuple[list[dict], Optional[int]]:
+        params = {**slim, "type": type_id, "X-Plex-Container-Start": start, "X-Plex-Container-Size": size}
+        mc = (await self._get(f"/library/sections/{section}/all", params, token)).get("MediaContainer", {})
+        total = mc.get("totalSize")
+        return mc.get("Metadata") or [], int(total) if total is not None else None
+
     async def _list_section(self, section: str, type_id: int, token: Optional[str], slim: dict) -> list[dict]:
+        """按位置分页读取（与 plexapi 一致，按请求的页大小前进）。
+        某页出错时对半拆分重试，拆到单条仍出错就跳过，避免一个坏条目让整轮对账失败"""
         out: list[dict] = []
+        total: Optional[int] = None
+        skipped = 0
+
+        async def fetch(start: int, size: int) -> list[dict]:
+            nonlocal total, skipped
+            try:
+                metas, t = await self._list_page(section, type_id, token, slim, start, size)
+            except (aiohttp.ClientResponseError, asyncio.TimeoutError) as e:
+                if isinstance(e, aiohttp.ClientResponseError) and e.status < 500:
+                    raise
+                if size == PAGE_SIZE:
+                    # 整个服务器不可用时不拆分，直接报错
+                    await self._get("/", token=token)
+                if size == 1:
+                    skipped += 1
+                    if skipped > MAX_SKIPPED_ITEMS:
+                        raise
+                    log.warning(
+                        "Plex 资料库 %s（type=%s）第 %d 条读取失败（%s），已跳过",
+                        section, type_id, start, getattr(e, "status", "超时"),
+                    )
+                    return []
+                half = size // 2
+                first = await fetch(start, half)
+                # 前半段已越过末尾就不必再请求后半段
+                if total is not None and start + half >= total:
+                    return first
+                return first + await fetch(start + half, size - half)
+            if t is not None:
+                total = t
+            return metas
+
         start = 0
         while True:
-            params = {
-                **slim,
-                "type": type_id,
-                "X-Plex-Container-Start": start,
-                "X-Plex-Container-Size": PAGE_SIZE,
-            }
-            data = await self._get(f"/library/sections/{section}/all", params, token)
-            mc = data.get("MediaContainer", {})
-            metas = mc.get("Metadata") or []
+            metas = await fetch(start, PAGE_SIZE)
             out.extend(metas)
-            start += len(metas)
-            if not metas or start >= int(mc.get("totalSize", start)):
+            start += PAGE_SIZE
+            if total is None:
+                if not metas:
+                    return out
+            elif start >= total:
                 return out
 
     async def list_items(self, token: Optional[str] = None) -> list[MediaItem]:
