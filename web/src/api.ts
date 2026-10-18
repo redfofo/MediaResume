@@ -5,9 +5,22 @@ export interface Mapping {
   trakt_user: string | null
 }
 
+export type Server = 'plex' | 'emby'
+
+export interface PlexSettings {
+  url: string
+  token: string
+}
+
+export interface EmbySettings {
+  url: string
+  api_key: string
+}
+
 export interface Config {
-  plex: { url: string; token: string }
-  emby: { url: string; api_key: string }
+  // 可以只配置其中一个服务器（只与 Trakt 同步），未使用的为 null
+  plex: PlexSettings | null
+  emby: EmbySettings | null
   trakt: {
     client_id: string
     client_secret: string
@@ -48,18 +61,16 @@ export interface Status {
   error: string | null
   started_at: number | null
   dry_run: boolean
+  servers: Server[]
   plex_ws: boolean
   last_poll: number | null
   poll_error: string | null
   reconciling: boolean
   queue: number
-  pairs: {
-    id: string
-    plex_user: string | null
-    emby_user: string
+  pairs: (PairInfo & {
     trakt_user: string | null
     reconcile: ReconcileStats | null
-  }[]
+  })[]
   trakt: TraktStatus[]
   // 定时全量同步的下次执行时间（unix 秒），未开启的方向没有
   trakt_next: Partial<Record<TraktDirection, number>>
@@ -169,11 +180,24 @@ export interface ResumeResult extends ResumePlan {
   dst_count: number | null
 }
 
-export interface ResumePairBase {
+export interface PairInfo {
   id: string
+  // 该映射包含的服务器
+  servers: Server[]
+  // 为空表示服务器所有者
   plex_user: string | null
   emby_user: string
+}
+
+export interface ResumePairBase extends PairInfo {
   error?: string
+}
+
+export function pairLabel(p: PairInfo): string {
+  const sides: string[] = []
+  if (p.servers.includes('plex')) sides.push(`Plex[${p.plex_user || '服务器所有者'}]`)
+  if (p.servers.includes('emby')) sides.push(`Emby[${p.emby_user}]`)
+  return sides.join(' ⇄ ')
 }
 
 async function request<T>(method: string, url: string, body?: unknown): Promise<T> {
@@ -222,7 +246,10 @@ export const api = {
   logs: (after: number) => request<{ seq: number; logs: LogRecord[] }>('GET', `/api/logs?after=${after}`),
 }
 
-export function defaultConfig(): Config {
+// 页面表单中两个服务器的设置总是存在，停用的在保存时改为 null
+export type ConfigForm = Config & { plex: PlexSettings; emby: EmbySettings }
+
+export function defaultConfig(): ConfigForm {
   return {
     plex: { url: 'http://127.0.0.1:32400', token: '' },
     emby: { url: 'http://127.0.0.1:8096', api_key: '' },

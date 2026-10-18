@@ -203,3 +203,15 @@ def test_sigterm_exits_gracefully(tmp_path):
     finally:
         proc.kill()
     assert proc.returncode == 0 and "收到停止信号" in out
+
+
+def test_single_server_config_roundtrip(tmp_path):
+    from mediaresume.config import config_form, load_config, save_config
+
+    cfg = parse_config({"emby": {"url": "http://e", "api_key": "k"}, "mappings": [{"emby_user": "u", "trakt_user": "me"}],
+                        "trakt": {"client_id": "a"}})
+    save_config(cfg, tmp_path / "config.yaml")
+    assert load_config(tmp_path / "config.yaml") == cfg
+    # 页面据 null 显示该服务器未启用
+    assert config_form({"plex": None, "emby": {"url": "http://e"}})["plex"] is None
+    assert config_form({"emby": {"url": "http://e"}})["plex"] == {"url": "", "token": ""}

@@ -2,17 +2,26 @@
 import { computed, onMounted, reactive, ref } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Connection, Delete, Plus } from '@element-plus/icons-vue'
-import { api, defaultConfig, type Config, type EmbyTest, type PlexTest, type Status } from '../api'
+import { api, defaultConfig, type Config, type ConfigForm, type EmbyTest, type PlexTest, type Status } from '../api'
 import TraktAuthDialog from './TraktAuthDialog.vue'
 
 const emit = defineEmits<{ saved: [status: Status] }>()
 
 const loading = ref(true)
 const saving = ref(false)
-const cfg = reactive<Config>(defaultConfig())
+const cfg = reactive<ConfigForm>(defaultConfig())
+// 可以只启用一个服务器（只与 Trakt 同步）；停用的服务器保存为 null
+const enabled = reactive({ plex: true, emby: true })
+const dual = computed(() => enabled.plex && enabled.emby)
 const plexTest = ref<PlexTest | null>(null)
 const embyTest = ref<EmbyTest | null>(null)
 const testing = reactive({ plex: false, emby: false })
+
+// 宽屏下用户映射的列：Plex 用户、Token、Emby 用户各占一份，按启用的服务器增减
+const mappingColumns = computed(() => {
+  const n = (enabled.plex ? 2 : 0) + (enabled.emby ? 1 : 0)
+  return { '--mapping-columns': `repeat(${n}, minmax(0, 1fr)) minmax(0, 0.8fr) 48px` }
+})
 
 // 非所有者的 Plex 账户（所有者对应 plex_user 为空）
 const plexAccounts = computed(() => (plexTest.value?.accounts ?? []).filter((a) => !a.owner))
@@ -96,6 +105,8 @@ async function save() {
   try {
     const payload: Config = {
       ...cfg,
+      plex: enabled.plex ? cfg.plex : null,
+      emby: enabled.emby ? cfg.emby : null,
       mappings: cfg.mappings.map((m) => ({
         plex_user: m.plex_user || null,
         emby_user: m.emby_user,
@@ -117,9 +128,19 @@ async function save() {
 onMounted(async () => {
   try {
     const [res] = await Promise.all([api.getConfig(), loadTraktAccounts()])
-    if (res.config) Object.assign(cfg, { ...res.config, trakt: { ...defaultConfig().trakt, ...res.config.trakt } })
+    if (res.config) {
+      const d = defaultConfig()
+      enabled.plex = !!res.config.plex
+      enabled.emby = !!res.config.emby
+      Object.assign(cfg, {
+        ...res.config,
+        plex: res.config.plex ?? d.plex,
+        emby: res.config.emby ?? d.emby,
+        trakt: { ...d.trakt, ...res.config.trakt },
+      })
+    }
     if (res.error) ElMessage.warning(`现有配置文件无效：${res.error}`)
-    if (res.config) await Promise.all([testPlex(true), testEmby(true)])
+    if (res.config) await Promise.all([enabled.plex && testPlex(true), enabled.emby && testEmby(true)])
   } catch (e) {
     ElMessage.error((e as Error).message)
   } finally {
@@ -135,36 +156,52 @@ onMounted(async () => {
         <el-card shadow="never">
           <template #header>
             <div class="card-header">
-              <span>Plex</span>
-              <el-tag v-if="plexTest?.ok" type="success">{{ plexTest.name }} · {{ plexTest.version }}</el-tag>
-              <el-tag v-else-if="plexTest" type="danger">{{ plexTest.error }}</el-tag>
+              <span class="server-title">
+                <el-switch v-model="enabled.plex" :disabled="!enabled.emby" />
+                Plex
+              </span>
+              <template v-if="enabled.plex">
+                <el-tag v-if="plexTest?.ok" type="success">{{ plexTest.name }} · {{ plexTest.version }}</el-tag>
+                <el-tag v-else-if="plexTest" type="danger">{{ plexTest.error }}</el-tag>
+              </template>
             </div>
           </template>
-          <el-form-item label="服务器地址">
-            <el-input v-model="cfg.plex.url" placeholder="http://192.168.1.10:32400" />
-          </el-form-item>
-          <el-form-item label="X-Plex-Token（服务器所有者）">
-            <el-input v-model="cfg.plex.token" type="password" show-password placeholder="Plex Token" />
-          </el-form-item>
-          <el-button :icon="Connection" :loading="testing.plex" @click="testPlex()">测试连接</el-button>
+          <template v-if="enabled.plex">
+            <el-form-item label="服务器地址">
+              <el-input v-model="cfg.plex.url" placeholder="http://192.168.1.10:32400" />
+            </el-form-item>
+            <el-form-item label="X-Plex-Token（服务器所有者）">
+              <el-input v-model="cfg.plex.token" type="password" show-password placeholder="Plex Token" />
+            </el-form-item>
+            <el-button :icon="Connection" :loading="testing.plex" @click="testPlex()">测试连接</el-button>
+          </template>
+          <el-text v-else type="info">不使用 Plex，Emby 只与 Trakt 同步</el-text>
         </el-card>
       </el-col>
       <el-col :xs="24" :md="12">
         <el-card shadow="never">
           <template #header>
             <div class="card-header">
-              <span>Emby</span>
-              <el-tag v-if="embyTest?.ok" type="success">{{ embyTest.name }} · {{ embyTest.version }}</el-tag>
-              <el-tag v-else-if="embyTest" type="danger">{{ embyTest.error }}</el-tag>
+              <span class="server-title">
+                <el-switch v-model="enabled.emby" :disabled="!enabled.plex" />
+                Emby
+              </span>
+              <template v-if="enabled.emby">
+                <el-tag v-if="embyTest?.ok" type="success">{{ embyTest.name }} · {{ embyTest.version }}</el-tag>
+                <el-tag v-else-if="embyTest" type="danger">{{ embyTest.error }}</el-tag>
+              </template>
             </div>
           </template>
-          <el-form-item label="服务器地址">
-            <el-input v-model="cfg.emby.url" placeholder="http://192.168.1.11:8096" />
-          </el-form-item>
-          <el-form-item label="API 密钥">
-            <el-input v-model="cfg.emby.api_key" type="password" show-password placeholder="Emby 后台 → 高级 → API 密钥" />
-          </el-form-item>
-          <el-button :icon="Connection" :loading="testing.emby" @click="testEmby()">测试连接</el-button>
+          <template v-if="enabled.emby">
+            <el-form-item label="服务器地址">
+              <el-input v-model="cfg.emby.url" placeholder="http://192.168.1.11:8096" />
+            </el-form-item>
+            <el-form-item label="API 密钥">
+              <el-input v-model="cfg.emby.api_key" type="password" show-password placeholder="Emby 后台 → 高级 → API 密钥" />
+            </el-form-item>
+            <el-button :icon="Connection" :loading="testing.emby" @click="testEmby()">测试连接</el-button>
+          </template>
+          <el-text v-else type="info">不使用 Emby，Plex 只与 Trakt 同步</el-text>
         </el-card>
       </el-col>
     </el-row>
@@ -177,23 +214,32 @@ onMounted(async () => {
         </div>
       </template>
       <el-alert
-        v-if="!plexTest?.ok || !embyTest?.ok"
-        title="测试两边连接成功后，可直接从下拉列表选择用户"
+        v-if="(enabled.plex && !plexTest?.ok) || (enabled.emby && !embyTest?.ok)"
+        title="测试连接成功后，可直接从下拉列表选择用户"
+        type="info"
+        :closable="false"
+        class="hint"
+      />
+      <el-alert
+        v-if="!dual"
+        title="只使用一个服务器时，每个映射都需要选择 Trakt 账户"
         type="info"
         :closable="false"
         class="hint"
       />
       <!-- 宽屏按列排布，窄屏每条映射一张卡片 -->
       <div class="mappings">
-        <div class="mapping mapping-head">
-          <span>Plex 用户</span>
-          <span>Plex 用户 Token</span>
-          <span>Emby 用户</span>
+        <div class="mapping mapping-head" :style="mappingColumns">
+          <template v-if="enabled.plex">
+            <span>Plex 用户</span>
+            <span>Plex 用户 Token</span>
+          </template>
+          <span v-if="enabled.emby">Emby 用户</span>
           <span>Trakt 账户</span>
           <span />
         </div>
-        <div v-for="(row, i) in cfg.mappings" :key="i" class="mapping">
-          <div class="field">
+        <div v-for="(row, i) in cfg.mappings" :key="i" class="mapping" :style="mappingColumns">
+          <div v-if="enabled.plex" class="field">
             <span class="field-label">Plex 用户</span>
             <el-select
               v-model="row.plex_user"
@@ -205,7 +251,7 @@ onMounted(async () => {
               <el-option v-for="a in plexAccounts" :key="a.id" :label="a.name" :value="a.name" />
             </el-select>
           </div>
-          <div class="field">
+          <div v-if="enabled.plex" class="field">
             <span class="field-label">Plex 用户 Token</span>
             <el-input
               v-if="row.plex_user"
@@ -216,7 +262,7 @@ onMounted(async () => {
             />
             <el-text v-else type="info">使用所有者 Token</el-text>
           </div>
-          <div class="field">
+          <div v-if="enabled.emby" class="field">
             <span class="field-label">Emby 用户</span>
             <el-select v-model="row.emby_user" filterable allow-create placeholder="选择 Emby 用户">
               <el-option v-for="u in embyUsers" :key="u.id" :label="u.name" :value="u.id" />
@@ -224,7 +270,7 @@ onMounted(async () => {
           </div>
           <div class="field">
             <span class="field-label">Trakt 账户</span>
-            <el-select v-model="row.trakt_user" clearable placeholder="不同步到 Trakt">
+            <el-select v-model="row.trakt_user" clearable :placeholder="dual ? '不同步到 Trakt' : '选择 Trakt 账户'">
               <el-option v-for="u in traktAccounts" :key="u" :label="u" :value="u" />
             </el-select>
           </div>
@@ -413,13 +459,18 @@ onMounted(async () => {
 .switch-hint {
   margin-left: 12px;
 }
+.server-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
 .actions {
   display: flex;
   justify-content: flex-end;
 }
 .mapping {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(0, 0.8fr) 48px;
+  grid-template-columns: var(--mapping-columns);
   gap: 12px;
   align-items: center;
   padding: 12px 0;

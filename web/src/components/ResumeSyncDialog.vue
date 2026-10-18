@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api, type ResumeDirection, type ResumePairBase, type ResumePlan, type ResumeResult } from '../api'
+import { api, pairLabel, type ResumeDirection, type ResumePairBase, type ResumePlan, type ResumeResult } from '../api'
 
 const visible = defineModel<boolean>({ required: true })
 
@@ -29,7 +29,6 @@ watch([direction, visible], () => {
   results.value = null
 })
 
-const pairLabel = (p: ResumePairBase) => `Plex[${p.plex_user || '服务器所有者'}] ⇄ Emby[${p.emby_user}]`
 const fmtPos = (ms?: number) => {
   if (!ms) return ''
   const s = Math.floor(ms / 1000)

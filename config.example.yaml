@@ -1,3 +1,4 @@
+# 只用其中一个服务器时，把另一个写成 null（如 emby: null），此时每个映射都要填写 trakt_user，只与 Trakt 同步
 plex:
   url: http://192.168.1.10:32400
   token: your-plex-token          # 服务器所有者的 X-Plex-Token

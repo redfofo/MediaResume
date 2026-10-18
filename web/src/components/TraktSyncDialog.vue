@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { api, type ResumePairBase, type TraktDirection, type TraktPlan, type TraktPlanEntry } from '../api'
+import { api, pairLabel as basePairLabel, type ResumePairBase, type TraktDirection, type TraktPlan, type TraktPlanEntry } from '../api'
 
 const props = defineProps<{ direction: TraktDirection }>()
 const visible = defineModel<boolean>({ required: true })
@@ -19,6 +19,12 @@ interface Section {
   label: string
   kind: 'watched' | 'progress' | 'clear'
 }
+// 本地服务器名称：只配置了一个服务器时只显示它
+const local = computed(() => {
+  const servers = new Set((preview.value ?? []).flatMap((p) => p.servers))
+  if (servers.size === 1) return servers.has('plex') ? 'Plex' : 'Emby'
+  return 'Plex / Emby'
+})
 const sections = computed<Section[]>(() =>
   toTrakt.value
     ? [
@@ -27,8 +33,8 @@ const sections = computed<Section[]>(() =>
         { key: 'clear', label: '清除 Trakt 上已看完条目的进度', kind: 'clear' },
       ]
     : [
-        { key: 'watched', label: '在 Plex / Emby 标记已看', kind: 'watched' },
-        { key: 'progress', label: '写入 Plex / Emby 播放进度', kind: 'progress' },
+        { key: 'watched', label: `在 ${local.value} 标记已看`, kind: 'watched' },
+        { key: 'progress', label: `写入 ${local.value} 播放进度`, kind: 'progress' },
       ],
 )
 
@@ -41,7 +47,7 @@ const total = computed(() =>
 )
 
 const pairLabel = (p: ResumePairBase & { plan?: TraktPlan }) =>
-  `Plex[${p.plex_user || '服务器所有者'}] ⇄ Emby[${p.emby_user}]` + (p.plan ? ` · Trakt[${p.plan.trakt_user}]` : '')
+  basePairLabel(p) + (p.plan ? ` · Trakt[${p.plan.trakt_user}]` : '')
 const fmtDate = (ts?: number) => (ts && ts > 0 ? new Date(ts * 1000).toLocaleDateString() : '未知')
 const fmtPct = (v?: number | null) => (v == null ? '—' : `${Math.round(v)}%`)
 
@@ -95,7 +101,7 @@ async function execute() {
   <el-dialog v-model="visible" :title="title" width="min(860px, 94vw)" top="6vh">
     <el-alert type="info" :closable="false" show-icon class="block">
       <template v-if="toTrakt">
-        以 Plex / Emby 合并后的状态为准（最近一次对账）：已看而 Trakt 上没有的补观看记录；看到一半的写入 Trakt 进度（1%～79%）；
+        以 {{ local }}{{ local.includes('/') ? ' 合并后' : ' 中' }}的状态为准（最近一次对账）：已看而 Trakt 上没有的补观看记录；看到一半的写入 Trakt 进度（1%～79%）；
         已看完的清除 Trakt 上残留的进度。不会删除 Trakt 上的观看记录。
       </template>
       <template v-else>

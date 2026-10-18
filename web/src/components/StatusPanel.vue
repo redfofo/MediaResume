@@ -2,11 +2,13 @@
 import { computed, h, nextTick, onMounted, onUnmounted, ref, watch, type VNode } from 'vue'
 import { ElMessage, ElTag, ElText } from 'element-plus'
 import { Download, Refresh, RefreshRight, SortDown, SortUp, Switch, Upload } from '@element-plus/icons-vue'
-import { api, type LogRecord, type ReconcileStats, type Status, type TraktDirection, type TraktStatus } from '../api'
+import { api, pairLabel, type LogRecord, type ReconcileStats, type Status, type TraktDirection, type TraktStatus } from '../api'
 import ResumeSyncDialog from './ResumeSyncDialog.vue'
 import TraktSyncDialog from './TraktSyncDialog.vue'
 
-defineProps<{ status: Status | null }>()
+const props = defineProps<{ status: Status | null }>()
+const servers = computed(() => props.status?.servers ?? ['plex', 'emby'])
+const dual = computed(() => servers.value.length === 2)
 const emit = defineEmits<{ refresh: [] }>()
 
 const logs = ref<LogRecord[]>([])
@@ -84,7 +86,14 @@ const ReconcileResult = (props: { stats?: ReconcileStats | null }) => {
   if (!r) return h('span', '等待首次对账')
   if (r.error) return h(ElText, { type: 'danger' }, () => r.error)
   // 每一项整体换行，分隔点留在行尾
-  const items = [`Plex ${r.plex}`, `Emby ${r.emby}`, `匹配 ${r.matched}`, `同步 ${r.changed}`, `${r.seconds}s`]
+  // 只有一个服务器时没有匹配和同步
+  const items = [
+    r.plex != null && `Plex ${r.plex}`,
+    r.emby != null && `Emby ${r.emby}`,
+    r.matched != null && `匹配 ${r.matched}`,
+    r.changed != null && `同步 ${r.changed}`,
+    `${r.seconds}s`,
+  ].filter((t): t is string => !!t)
   const parts: (VNode | string)[] = items.flatMap((t, i) =>
     i < items.length - 1 || r.failed ? [h('span', { style: NOWRAP }, `${t} ·`), ' '] : [h('span', { style: NOWRAP }, t)],
   )
@@ -130,8 +139,14 @@ onUnmounted(() => window.clearInterval(timer))
       </el-col>
       <el-col :xs="12" :sm="6">
         <el-card shadow="never" class="stat">
-          <div class="label">Plex WebSocket</div>
-          <el-tag :type="status.plex_ws ? 'success' : 'danger'">{{ status.plex_ws ? '已连接' : '未连接' }}</el-tag>
+          <template v-if="servers.includes('plex')">
+            <div class="label">Plex WebSocket</div>
+            <el-tag :type="status.plex_ws ? 'success' : 'danger'">{{ status.plex_ws ? '已连接' : '未连接' }}</el-tag>
+          </template>
+          <template v-else>
+            <div class="label">服务器</div>
+            <el-tag type="info">仅 Emby</el-tag>
+          </template>
         </el-card>
       </el-col>
       <el-col :xs="12" :sm="6">
@@ -161,7 +176,7 @@ onUnmounted(() => window.clearInterval(timer))
             <el-button :icon="Refresh" :loading="busy" :disabled="!status.running" @click="run('reconcile')">
               立即对账
             </el-button>
-            <el-button :icon="Switch" :disabled="!status.running" @click="resumeDialog = true">
+            <el-button v-if="dual" :icon="Switch" :disabled="!status.running" @click="resumeDialog = true">
               同步继续观看
             </el-button>
             <el-button :icon="RefreshRight" :loading="busy" :disabled="!status.configured" @click="run('restart')">
@@ -171,10 +186,10 @@ onUnmounted(() => window.clearInterval(timer))
         </div>
       </template>
       <el-table :data="status.pairs" empty-text="引擎未运行" class="wide-only">
-        <el-table-column label="Plex 用户" min-width="120">
+        <el-table-column v-if="servers.includes('plex')" label="Plex 用户" min-width="120">
           <template #default="{ row }">{{ row.plex_user || '服务器所有者' }}</template>
         </el-table-column>
-        <el-table-column prop="emby_user" label="Emby 用户" min-width="120" />
+        <el-table-column v-if="servers.includes('emby')" prop="emby_user" label="Emby 用户" min-width="120" />
         <el-table-column v-if="status.trakt.length" label="Trakt" min-width="100">
           <template #default="{ row }">{{ row.trakt_user || '—' }}</template>
         </el-table-column>
@@ -191,7 +206,7 @@ onUnmounted(() => window.clearInterval(timer))
         <el-empty v-if="!status.pairs.length" description="引擎未运行" :image-size="60" />
         <div v-for="row in status.pairs" :key="row.id" class="item">
           <div class="item-title">
-            {{ row.plex_user || '服务器所有者' }} ⇄ {{ row.emby_user }}
+            {{ pairLabel(row) }}
             <template v-if="status.trakt.length">→ Trakt {{ row.trakt_user || '—' }}</template>
           </div>
           <div class="item-row">

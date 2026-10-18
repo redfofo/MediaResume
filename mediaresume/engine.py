@@ -50,6 +50,7 @@ def decide(plex: WatchState, emby: WatchState, base: Optional[WatchState]) -> Op
 @dataclass
 class Pair:
     mapping: Mapping
+    # 未配置的服务器一端为空字符串
     plex_token: str
     emby_user_id: str
     emby_user_name: str = ""
@@ -76,12 +77,23 @@ class Pair:
 
     @property
     def id(self) -> str:
+        # 双端映射的 id 格式不能变：数据库中的基准和 Trakt 已见记录按它保存
+        if not self.emby_user_id:
+            return f"plex:{self.mapping.plex_user or '@owner'}"
+        if not self.plex_token:
+            return f"emby:{self.emby_user_id}"
         return f"{self.mapping.plex_user or '@owner'}|{self.emby_user_id}"
 
     @property
     def label(self) -> str:
         """日志中显示的简短名称（id 含 Emby 用户 GUID，太长）"""
-        return f"{self.mapping.plex_user or '所有者'}⇄{self.emby_user_name or self.emby_user_id[:8]}"
+        plex = self.mapping.plex_user or "所有者"
+        emby = self.emby_user_name or self.emby_user_id[:8]
+        if not self.emby_user_id:
+            return f"Plex:{plex}"
+        if not self.plex_token:
+            return f"Emby:{emby}"
+        return f"{plex}⇄{emby}"
 
     def accepts_plex_user(self, user_id: Optional[str], username: Optional[str]) -> bool:
         if self.mapping.plex_user is None:
@@ -92,11 +104,19 @@ class Pair:
 
 class SyncEngine:
     def __init__(
-        self, cfg: Config, plex: PlexClient, emby: EmbyClient, store: StateStore, trakt: Optional[TraktSync] = None
+        self,
+        cfg: Config,
+        plex: Optional[PlexClient],
+        emby: Optional[EmbyClient],
+        store: StateStore,
+        trakt: Optional[TraktSync] = None,
     ):
         self.cfg = cfg
+        # 只配置了一个服务器时，另一个客户端为 None，只与 Trakt 同步
         self.plex = plex
         self.emby = emby
+        self.servers = cfg.servers
+        self.dual = len(self.servers) == 2
         self.store = store
         # 未绑定 Trakt 账户时为 None
         self.trakt = trakt
@@ -129,13 +149,20 @@ class SyncEngine:
     async def setup(self) -> None:
         self.pairs = []
         for m in self.cfg.mappings:
-            user = await self.emby.resolve_user(m.emby_user)
-            pair = Pair(m, m.plex_token or self.cfg.plex.token, user["id"], user["name"])
+            user = await self.emby.resolve_user(m.emby_user) if "emby" in self.servers else {"id": "", "name": ""}
+            plex_token = (m.plex_token or self.cfg.plex.token) if "plex" in self.servers else ""
+            pair = Pair(m, plex_token, user["id"], user["name"])
             self.pairs.append(pair)
-            log.info("用户映射: Plex[%s] <-> Emby[%s] (%s)", m.plex_user or "所有者", user["name"], user["id"])
+            sides = []
+            if plex_token:
+                sides.append(f"Plex[{m.plex_user or '所有者'}]")
+            if user["id"]:
+                sides.append(f"Emby[{user['name']}] ({user['id']})")
+            if self.dual:
+                log.info("用户映射: %s", " <-> ".join(sides))
             if self.trakt and m.trakt_user:
                 self.trakt.add_account(m.trakt_user)
-                log.info("用户映射: Plex[%s] / Emby[%s] -> Trakt[%s]", m.plex_user or "所有者", user["name"], m.trakt_user)
+                log.info("用户映射: %s -> Trakt[%s]", " / ".join(sides), m.trakt_user)
 
     async def _setup_until_ready(self) -> None:
         """容器开机时 Emby 可能还没启动：初始化失败时退避重试，而不是让引擎退出"""
@@ -157,12 +184,9 @@ class SyncEngine:
         for pair in self.pairs:
             pair.plex_since = pair.emby_since = now
         self.request_reconcile()
-        tasks = [
-            self._worker(),
-            self._reconcile_timer(),
-            self._poll_loop(),
-            self.plex.listen(self.on_plex_playing, self._on_plex_connect),
-        ]
+        tasks = [self._worker(), self._reconcile_timer(), self._poll_loop()]
+        if self.plex:
+            tasks.append(self.plex.listen(self.on_plex_playing, self._on_plex_connect))
         if self.trakt and self.trakt.accounts:
             tasks.append(self.trakt.run())
             for direction, hours in (("to_trakt", self.cfg.trakt.push_interval), ("from_trakt", self.cfg.trakt.pull_interval)):
@@ -245,9 +269,12 @@ class SyncEngine:
 
     async def _poll(self, pair: Pair) -> None:
         now = time.time()
-        for item_id in await self.emby.changed_since(pair.emby_user_id, pair.emby_since - POLL_OVERLAP):
-            self.queue.put_nowait(("emby", pair, item_id))
-        pair.emby_since = now
+        if "emby" in self.servers:
+            for item_id in await self.emby.changed_since(pair.emby_user_id, pair.emby_since - POLL_OVERLAP):
+                self.queue.put_nowait(("emby", pair, item_id))
+            pair.emby_since = now
+        if "plex" not in self.servers:
+            return
         for rk, show_rk in await self.plex.recently_viewed(int(pair.plex_since) - POLL_OVERLAP, pair.plex_token):
             self.queue.put_nowait(("plex", pair, rk))
             if show_rk:
@@ -255,7 +282,8 @@ class SyncEngine:
             else:
                 pair.plex_active_movies.add(rk)
         pair.plex_since = now
-        await self._poll_resume(pair)
+        if self.dual:
+            await self._poll_resume(pair)
         if now - pair.unwatch_polled_at >= self.cfg.sync.unwatch_poll_interval:
             await self._poll_plex_unwatched(pair)
             pair.unwatch_polled_at = now
@@ -286,11 +314,13 @@ class SyncEngine:
                 log.warning("[%s] 读取 Plex 剧集 %s 失败: %s", pair.label, show_rk, str(e) or e.__class__.__name__)
                 continue
             for ep in episodes:
-                base = self.store.get(pair.id, ep.key)
-                if ep.state.played or base is None:
+                if ep.state.played:
                     continue
+                # 基准只记录两端都有、同步过的条目；只在 Plex 中的条目（包括只配置了 Plex 时）
+                # 改用 Trakt 同步记录的统一状态，否则标记未看无法同步到 Trakt
+                before = [b for b in (self.store.get(pair.id, ep.key), pair.unified.get(ep.key, (None,))[0]) if b]
                 # 已看被标记未看，或看到一半被清除进度（标记未看）
-                if base.played or (base.position_ms >= POSITION_TOLERANCE_MS and ep.state.position_ms == 0):
+                if any(b.played or (b.position_ms >= POSITION_TOLERANCE_MS and ep.state.position_ms == 0) for b in before):
                     self.queue.put_nowait(("plex", pair, ep.item_id))
 
     # ---------- 从继续观看移除 ----------
@@ -377,6 +407,8 @@ class SyncEngine:
     #                     只是“下一集”推荐的：目标为 Emby 时取消隐藏，目标为 Plex 时无接口可加入。
 
     async def resume_sync_plan(self, pair: Pair, src: str) -> dict:
+        if not self.dual:
+            raise ValueError("同步继续观看需要同时配置 Plex 和 Emby")
         dst = "emby" if src == "plex" else "plex"
         src_entries = await self._resume_entries(src, pair)
         dst_entries = await self._resume_entries(dst, pair)
@@ -546,7 +578,8 @@ class SyncEngine:
         for key in (src_item.key, *src_item.alt_keys):
             # 同步会更新基准时间，要在同步前判断
             readded = self._readded(pair, key, src_item)
-            await self._sync_key(src, pair, replace(src_item, key=key, alt_keys=()))
+            if self.dual:
+                await self._sync_key(src, pair, replace(src_item, key=key, alt_keys=()))
             # Plex 正在播放时，Emby 侧的变化是我们同步过去的，不能当成“暂停”推给 Trakt
             live = src == "plex" or not any(self._is_playing(pair, i) for i in pair.plex_index.get(key, []))
             self._observe(pair, key, src_item.state, src_item.title, src_item.duration_ms, playing, live, readded)
@@ -600,8 +633,9 @@ class SyncEngine:
 
     async def _reconcile(self, pair: Pair) -> None:
         started = time.monotonic()
-        plex_groups = await self._index("plex", pair)
-        emby_groups = await self._index("emby", pair)
+        # 未配置的服务器视为空媒体库：所有条目都只在一端，只记录状态供 Trakt 使用
+        plex_groups = await self._index("plex", pair) if "plex" in self.servers else {}
+        emby_groups = await self._index("emby", pair) if "emby" in self.servers else {}
         changed = 0
         # 只在一端存在的条目不参与双向同步，但它们的状态同样是用户的观看记录
         for key in plex_groups.keys() ^ emby_groups.keys():
@@ -629,6 +663,14 @@ class SyncEngine:
                     pending = 0
         finally:
             self.store.commit()
+        seconds = round(time.monotonic() - started, 1)
+        if not self.dual:
+            # 只有一个服务器时没有匹配和同步，只报告该服务器的条目数
+            server = self.servers[0]
+            count = len(plex_groups or emby_groups)
+            self.reconcile_stats[pair.id] = {"at": time.time(), server: count, "seconds": seconds}
+            log.info("[%s] 读取媒体库完成：%s %d 项，用时 %.1fs", pair.label, server.capitalize(), count, seconds)
+            return
         stats = {
             "at": time.time(),
             "plex": len(plex_groups),
@@ -636,12 +678,12 @@ class SyncEngine:
             "matched": len(plex_groups.keys() & emby_groups.keys()),
             "changed": changed,
             "failed": failed,
-            "seconds": round(time.monotonic() - started, 1),
+            "seconds": seconds,
         }
         self.reconcile_stats[pair.id] = stats
         log.info(
             "[%s] 对账完成：Plex %d 项，Emby %d 项，匹配 %d 项，同步 %d 项，失败 %d 项，用时 %.1fs",
-            pair.label, stats["plex"], stats["emby"], stats["matched"], changed, failed, stats["seconds"],
+            pair.label, stats["plex"], stats["emby"], stats["matched"], changed, failed, seconds,
         )
 
     async def _reconcile_key(
@@ -868,7 +910,9 @@ class SyncEngine:
                 log.warning("[%s] 从 Trakt 标记已看 %s 失败: %s", pair.label, key, str(e) or e.__class__.__name__)
                 continue
             if not self.cfg.sync.dry_run:
-                self.store.set(pair.id, key, target)
+                # 基准只记录两端都有的条目：只在一端时写入，另一端之后入库的未看条目会被对账当成“标记未看”同步过来
+                if p_items and e_items:
+                    self.store.set(pair.id, key, target)
                 # 两端稍后的回传事件不能被当成本地标记已看，再推回 Trakt
                 self._observe(pair, key, target, (p_items + e_items)[0].title, _duration(p_items + e_items))
             n_watched += 1
@@ -892,7 +936,8 @@ class SyncEngine:
                 log.warning("[%s] 从 Trakt 写入进度 %s 失败: %s", pair.label, key, str(e) or e.__class__.__name__)
                 continue
             if not self.cfg.sync.dry_run:
-                self.store.set(pair.id, key, target)
+                if p_items and e_items:
+                    self.store.set(pair.id, key, target)
                 self._observe(pair, key, target, items[0].title, duration)
             if acc:
                 # 写入后两端的回传事件不应再把同样的进度推回 Trakt

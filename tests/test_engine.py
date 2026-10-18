@@ -286,3 +286,12 @@ def test_pair_label_is_short_and_id_unchanged():
     # id 是状态库的键，不能变
     assert pair.id == f"火火|{guid}"
     assert Pair(Mapping(None, "u"), "t", guid).label == "所有者⇄b0f3bd52"
+
+
+def test_single_server_pair_id_and_label():
+    guid = "b0f3bd52284f4e21bee729e7a73df4b5"
+    plex = Pair(Mapping("kid", ""), "t", "")
+    assert (plex.id, plex.label) == ("plex:kid", "Plex:kid")
+    assert Pair(Mapping(None, ""), "t", "").id == "plex:@owner"
+    emby = Pair(Mapping(None, "dlwlrma"), "", guid, "dlwlrma")
+    assert (emby.id, emby.label) == (f"emby:{guid}", "Emby:dlwlrma")

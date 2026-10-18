@@ -265,14 +265,21 @@ class Server:
         self.ops.append(("position", item_id, pos))
 
 
-def make_engine(tmp_path, plex_items, emby_items, dry_run=False, client=None):
-    plex, emby = Server("plex", plex_items), Server("emby", emby_items)
-    mapping = Mapping(None, "u", trakt_user="me")
-    cfg = Config(PlexConfig("http://p", "t"), EmbyConfig("http://e", "k"), [mapping], SyncConfig(dry_run=dry_run))
+def make_engine(tmp_path, plex_items, emby_items, dry_run=False, client=None, servers=("plex", "emby")):
+    """servers 只含一个时，另一端的客户端为 None（只与 Trakt 同步）"""
+    plex = Server("plex", plex_items) if "plex" in servers else None
+    emby = Server("emby", emby_items) if "emby" in servers else None
+    mapping = Mapping(None, "u" if emby else "", trakt_user="me")
+    cfg = Config(
+        PlexConfig("http://p", "t") if plex else None,
+        EmbyConfig("http://e", "k") if emby else None,
+        [mapping],
+        SyncConfig(dry_run=dry_run),
+    )
     sync = TraktSync(client or FakeClient(), TraktConfig("id", "s"), dry_run)
     sync.add_account("me")
     eng = SyncEngine(cfg, plex, emby, StateStore(str(tmp_path / "e.db")), sync)
-    pair = Pair(mapping, "t", "u")
+    pair = Pair(mapping, "t" if plex else "", "u" if emby else "")
     eng.pairs.append(pair)
     return eng, pair, plex, emby, sync.accounts["me"]
 
@@ -404,6 +411,105 @@ def test_live_events_push_progress(tmp_path):
     del eng._plex_playing[(pair.id, "1")]
     run(eng._handle_event("emby", pair, "a"))
     assert acc.pending[EP1][1] == "stop"
+
+
+class UnwatchPlex(Server):
+    """Plex 标记未看检测所需的接口：已看电影集合、每部剧的已看集数、剧的全部单集"""
+
+    def __init__(self, items, counts):
+        super().__init__("plex", items)
+        self.counts = counts
+
+    async def watched_movies(self, *_):
+        return set()
+
+    async def show_viewed_counts(self, *_):
+        return dict(self.counts)
+
+    async def show_episodes(self, *_):
+        return [i for i in self.items.values() if i.key.kind == "episode"]
+
+
+def test_episode_unwatch_only_in_plex_is_detected(tmp_path):
+    # 双端模式下只在 Plex 中的剧集没有基准，之前标记未看检测不到，Trakt 收不到
+    eng, pair, *_ = make_engine(tmp_path, [], [])
+    plex = UnwatchPlex([MediaItem("plex", "1", EP1, WatchState(False, 0))], {"show": 1})
+    eng.plex = plex
+    run(eng._poll_plex_unwatched(pair))  # 建立快照
+    pair.unified[EP1] = (played(), "", H)
+    plex.counts["show"] = 0
+    run(eng._poll_plex_unwatched(pair))
+    assert [j[2] for j in drain(eng)] == ["1"]
+
+
+def test_episode_unwatch_without_any_record_is_ignored(tmp_path):
+    eng, pair, *_ = make_engine(tmp_path, [], [])
+    plex = UnwatchPlex([MediaItem("plex", "1", EP1, WatchState(False, 0))], {"show": 1})
+    eng.plex = plex
+    run(eng._poll_plex_unwatched(pair))
+    plex.counts["show"] = 0
+    run(eng._poll_plex_unwatched(pair))
+    assert drain(eng) == []
+
+
+def test_trakt_pull_does_not_store_base_for_one_sided_item(tmp_path):
+    # 只在 Plex 中的条目写入基准后，Emby 之后入库的未看条目会被对账当成“标记未看”同步回 Plex
+    eng, pair, plex, *_ = make_engine(tmp_path, [MediaItem("plex", "1", EP1, WatchState(False, 0))], [])
+    pair.plex_index[EP1] = ["1"]
+    run(eng._trakt_pull(pair, {EP1: NOW}, {}))
+    assert plex.ops == [("played", "1")]
+    assert eng.store.get(pair.id, EP1) is None
+    assert pair.unified[EP1][0].played
+
+
+@pytest.mark.parametrize("server", ["plex", "emby"])
+def test_single_server_reconcile_feeds_trakt(tmp_path, server):
+    items = [MediaItem(server, "1", MOVIE, played()), MediaItem(server, "2", EP1, WatchState(False, 900_000, NOW), duration_ms=H)]
+    eng, pair, *_ = make_engine(tmp_path, items, items, servers=(server,))
+    run(eng._reconcile(pair))
+    assert pair.unified[MOVIE][0].played and pair.unified[EP1][0].position_ms == 900_000
+    stats = eng.reconcile_stats[pair.id]
+    assert stats[server] == 2 and "matched" not in stats
+    assert eng.store.all(pair.id) == {}  # 没有另一端，不写基准
+
+
+def test_emby_only_live_event_pushes_to_trakt(tmp_path):
+    item = MediaItem("emby", "a", EP1, WatchState(False, 600_000, NOW), duration_ms=H)
+    eng, pair, _, emby, acc = make_engine(tmp_path, [], [item], servers=("emby",))
+    run(eng._handle_event("emby", pair, "a"))  # 不能去查找不存在的 Plex
+    assert acc.pending[EP1][1] == "stop"
+    assert emby.ops == []
+
+
+def test_plex_only_trakt_pull_writes_plex(tmp_path):
+    eng, pair, plex, *_ = make_engine(tmp_path, [MediaItem("plex", "1", EP1, WatchState(False, 0))], [], servers=("plex",))
+    run(eng._reconcile(pair))
+    run(eng._trakt_pull(pair, {EP1: NOW}, {}))
+    assert plex.ops == [("played", "1")]
+
+
+def test_emby_only_poll_skips_plex(tmp_path):
+    class Emby(Server):
+        async def changed_since(self, *_):
+            return ["a"]
+
+    eng, pair, *_ = make_engine(tmp_path, [], [], servers=("emby",))
+    eng.emby = Emby("emby", [])
+    run(eng._poll(pair))
+    assert [j[:1] + j[2:] for j in drain(eng)] == [("emby", "a")]
+
+
+def test_single_server_rejects_resume_sync(tmp_path):
+    eng, pair, *_ = make_engine(tmp_path, [], [], servers=("plex",))
+    with pytest.raises(ValueError, match="同时配置"):
+        run(eng.resume_sync_plan(pair, "plex"))
+
+
+def drain(eng):
+    jobs = []
+    while not eng.queue.empty():
+        jobs.append(eng.queue.get_nowait())
+    return jobs
 
 
 # ---------- 客户端 / 配置 ----------
@@ -926,3 +1032,21 @@ def test_config_unwatch_defaults_and_validation():
     assert cfg.trakt.sync_marks and not cfg.trakt.sync_unwatch and cfg.trakt.unwatch_max == 10
     with pytest.raises(ValueError):
         parse_config({**base, "trakt": {"unwatch_max": 0}})
+
+
+def test_config_single_server():
+    plex_only = {"plex": BASE["plex"], "trakt": {"client_id": "a"}}
+    cfg = parse_config({**plex_only, "mappings": [{"emby_user": "u", "trakt_user": "me"}]})
+    assert cfg.emby is None and cfg.servers == ("plex",)
+    assert cfg.mappings[0].emby_user == ""  # 未配置的一端的用户被清空
+    # 只有一个服务器时 Trakt 是唯一的同步对象
+    with pytest.raises(ValueError, match="都需要选择 Trakt 账户"):
+        parse_config({**plex_only, "mappings": [{}]})
+    with pytest.raises(ValueError, match="用户映射重复：Plex\\[所有者\\]$"):
+        parse_config({**plex_only, "mappings": [{"trakt_user": "me"}, {"trakt_user": "you"}]})
+    emby_only = {"plex": None, "emby": BASE["emby"], "trakt": {"client_id": "a"}}
+    cfg = parse_config({**emby_only, "mappings": [{"plex_user": "kid", "emby_user": "u", "trakt_user": "me"}]})
+    assert cfg.plex is None and cfg.servers == ("emby",)
+    assert cfg.mappings[0].plex_user is None  # 不会要求填写 Plex 用户 Token
+    with pytest.raises(ValueError, match="至少需要配置"):
+        parse_config({"mappings": [{"trakt_user": "me"}], "trakt": {"client_id": "a"}})

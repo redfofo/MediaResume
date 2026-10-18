@@ -43,7 +43,7 @@ class TraktConfig:
 class Mapping:
     # Plex 用户名（为空表示服务器所有者）
     plex_user: Optional[str]
-    # Emby 用户名或用户 Id
+    # Emby 用户名或用户 Id；未配置 Emby 时为空
     emby_user: str
     # 该 Plex 用户的 token，为空时使用 plex.token（所有者）
     plex_token: Optional[str] = None
@@ -68,13 +68,19 @@ class SyncConfig:
 
 @dataclass
 class Config:
-    plex: PlexConfig
-    emby: EmbyConfig
+    # 可以只配置其中一个服务器（此时只与 Trakt 同步），未配置的为 None
+    plex: Optional[PlexConfig]
+    emby: Optional[EmbyConfig]
     mappings: list[Mapping]
     sync: SyncConfig = field(default_factory=SyncConfig)
     trakt: TraktConfig = field(default_factory=TraktConfig)
     db_path: str = "data/state.db"
     log_level: str = "INFO"
+
+    @property
+    def servers(self) -> tuple[str, ...]:
+        """已配置的服务器，两者都有时 Plex 在前"""
+        return tuple(name for name, server in (("plex", self.plex), ("emby", self.emby)) if server)
 
 
 # 同步参数的取值下限（与 Web 页面一致）：过小会让轮询 / 对账空转，拖垮 Plex、Emby
@@ -105,20 +111,28 @@ def _as_bool(value: Any, name: str) -> bool:
 
 def parse_config(raw: dict[str, Any]) -> Config:
     """从 dict 构造并校验配置，校验失败抛出 ValueError"""
+    plex: Optional[PlexConfig] = None
+    emby: Optional[EmbyConfig] = None
+    # 整段缺失或为 null 表示不使用该服务器
     try:
-        plex = PlexConfig(url=str(raw["plex"]["url"]).strip().rstrip("/"), token=str(raw["plex"]["token"]).strip())
-        emby = EmbyConfig(url=str(raw["emby"]["url"]).strip().rstrip("/"), api_key=str(raw["emby"]["api_key"]).strip())
+        if raw.get("plex") is not None:
+            plex = PlexConfig(url=str(raw["plex"]["url"]).strip().rstrip("/"), token=str(raw["plex"]["token"]).strip())
+        if raw.get("emby") is not None:
+            emby = EmbyConfig(url=str(raw["emby"]["url"]).strip().rstrip("/"), api_key=str(raw["emby"]["api_key"]).strip())
     except (KeyError, TypeError) as e:
         raise ValueError(f"缺少配置项: {e}") from None
-    if not (plex.url and plex.token):
+    if plex and not (plex.url and plex.token):
         raise ValueError("Plex 地址和 token 不能为空")
-    if not (emby.url and emby.api_key):
+    if emby and not (emby.url and emby.api_key):
         raise ValueError("Emby 地址和 API 密钥不能为空")
+    if not (plex or emby):
+        raise ValueError("至少需要配置 Plex 或 Emby 中的一个")
     mappings = [
         Mapping(
-            plex_user=str(m.get("plex_user") or "").strip() or None,
-            emby_user=str(m.get("emby_user") or "").strip(),
-            plex_token=str(m.get("plex_token") or "").strip() or None,
+            # 未配置的一端的用户不参与同步，清空，避免影响去重和映射 id
+            plex_user=(str(m.get("plex_user") or "").strip() or None) if plex else None,
+            emby_user=str(m.get("emby_user") or "").strip() if emby else "",
+            plex_token=(str(m.get("plex_token") or "").strip() or None) if plex else None,
             trakt_user=str(m.get("trakt_user") or "").strip() or None,
         )
         for m in raw.get("mappings") or []
@@ -127,14 +141,18 @@ def parse_config(raw: dict[str, Any]) -> Config:
         raise ValueError("至少需要一个用户映射")
     seen: set[tuple[str, str]] = set()
     for m in mappings:
-        if not m.emby_user:
+        if emby and not m.emby_user:
             raise ValueError("用户映射中的 Emby 用户不能为空")
         if m.plex_user and not m.plex_token:
             # 否则会用所有者的 token 读写，把所有者的观看记录同步到这个用户的 Emby 账户，反之亦然
             raise ValueError(f"Plex 用户 {m.plex_user} 需要填写该用户自己的 Token（服务器所有者请把 Plex 用户留空）")
+        if not (plex and emby) and not m.trakt_user:
+            # 只有一个服务器时，Trakt 是唯一的同步对象
+            raise ValueError(f"只配置了 {'Plex' if plex else 'Emby'} 时，每个用户映射都需要选择 Trakt 账户")
         pair = ((m.plex_user or "").lower(), m.emby_user.lower())
         if pair in seen:
-            raise ValueError(f"用户映射重复：Plex[{m.plex_user or '所有者'}] ↔ Emby[{m.emby_user}]")
+            sides = [f"Plex[{m.plex_user or '所有者'}]"] * bool(plex) + [f"Emby[{m.emby_user}]"] * bool(emby)
+            raise ValueError(f"用户映射重复：{' ↔ '.join(sides)}")
         seen.add(pair)
     trakt_raw = raw.get("trakt") or {}
     trakt = TraktConfig(
@@ -183,6 +201,10 @@ def config_form(raw: Any) -> dict[str, Any]:
     form = config_to_dict(Config(PlexConfig("", ""), EmbyConfig("", ""), []))
     if not isinstance(raw, dict):
         return form
+    for section in ("plex", "emby"):
+        # 未使用的服务器保持 None，页面据此显示为停用
+        if section in raw and raw[section] is None:
+            form[section] = None
     for section in ("plex", "emby", "sync", "trakt"):
         if isinstance(raw.get(section), dict):
             form[section].update({k: v for k, v in raw[section].items() if k in form[section] and v is not None})

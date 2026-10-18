@@ -17,7 +17,7 @@ import yaml
 
 from .config import Config, TraktConfig, config_form, config_to_dict, load_config, parse_config, save_config
 from .emby import EmbyClient
-from .engine import SyncEngine
+from .engine import Pair, SyncEngine
 from .plex import PlexClient
 from .store import StateStore
 from .trakt import TraktClient, TraktSync, TraktTokenStore, token_record
@@ -100,10 +100,11 @@ class Runner:
                 client = TraktClient(self.http, self.cfg.trakt, self.trakt_tokens)
                 removed_log = self.config_path.parent / "data" / "trakt_removed.jsonl"
                 trakt = TraktSync(client, self.cfg.trakt, self.cfg.sync.dry_run, removed_log)
+            plex, emby = self.cfg.plex, self.cfg.emby
             self.engine = SyncEngine(
                 self.cfg,
-                PlexClient(self.http, self.cfg.plex.url, self.cfg.plex.token),
-                EmbyClient(self.http, self.cfg.emby.url, self.cfg.emby.api_key),
+                PlexClient(self.http, plex.url, plex.token) if plex else None,
+                EmbyClient(self.http, emby.url, emby.api_key) if emby else None,
                 self.store,
                 trakt,
             )
@@ -145,16 +146,16 @@ class Runner:
             "error": self.error or (eng.setup_error if running and eng else None),
             "started_at": self.started_at if running else None,
             "dry_run": bool(self.cfg and self.cfg.sync.dry_run),
-            "plex_ws": bool(running and eng and eng.plex.connected),
+            # 已配置的服务器；尚未配置时按两者都有展示
+            "servers": list(self.cfg.servers if self.cfg else ("plex", "emby")),
+            "plex_ws": bool(running and eng and eng.plex and eng.plex.connected),
             "last_poll": eng.last_poll if running and eng else None,
             "poll_error": eng.poll_error if running and eng else None,
             "reconciling": bool(running and eng and eng.reconciling),
             "queue": eng.queue.qsize() if running and eng else 0,
             "pairs": [
                 {
-                    "id": p.id,
-                    "plex_user": p.mapping.plex_user,
-                    "emby_user": p.emby_user_name or p.mapping.emby_user,
+                    **_pair_info(p),
                     "trakt_user": p.mapping.trakt_user,
                     "reconcile": eng.reconcile_stats.get(p.id),
                 }
@@ -382,10 +383,9 @@ def create_app(runner: Runner, logs: LogBuffer, dist: Path) -> web.Application:
             raise web.HTTPBadRequest(text='{"error": "direction 必须是 plex_to_emby 或 emby_to_plex"}', content_type="application/json")
         if not runner.engine or not runner.task or runner.task.done():
             raise web.HTTPConflict(text='{"error": "同步引擎未运行"}', content_type="application/json")
+        if not runner.engine.dual:
+            raise web.HTTPConflict(text='{"error": "同步继续观看需要同时配置 Plex 和 Emby"}', content_type="application/json")
         return "plex" if direction == "plex_to_emby" else "emby"
-
-    def _pair_info(p) -> dict:
-        return {"id": p.id, "plex_user": p.mapping.plex_user, "emby_user": p.emby_user_name or p.mapping.emby_user}
 
     @routes.post("/api/resume-sync/preview")
     async def resume_sync_preview(request: web.Request) -> web.Response:
@@ -441,6 +441,12 @@ def create_app(runner: Runner, logs: LogBuffer, dist: Path) -> web.Application:
     else:
         log.warning("未找到前端构建目录 %s，仅提供 API", dist)
     return app
+
+
+def _pair_info(p: Pair) -> dict:
+    # plex_user 为空表示服务器所有者，emby_user 为空表示未配置 Emby；是否有 Plex 看 servers
+    servers = [s for s, present in (("plex", p.plex_token), ("emby", p.emby_user_id)) if present]
+    return {"id": p.id, "servers": servers, "plex_user": p.mapping.plex_user, "emby_user": p.emby_user_name or p.mapping.emby_user}
 
 
 def _describe(exc: BaseException) -> str:
