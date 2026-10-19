@@ -88,6 +88,8 @@ class Runner:
         try:
             self.cfg = load_config(self.config_path)
         except Exception as e:
+            # 不保留上一次的配置，否则状态页会按旧配置展示服务器等信息
+            self.cfg = None
             self.error = f"配置无效: {e}"
             log.error(self.error)
             return

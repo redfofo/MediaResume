@@ -239,3 +239,15 @@ def test_warns_when_relative_db_outside_config_dir(tmp_path, monkeypatch, caplog
         monkeypatch.chdir(conf)
         _warn_db_location("data/state.db", conf / "config.yaml")  # 与配置同目录（Docker 默认）
         assert caplog.text == ""
+
+
+def test_invalid_config_clears_previous(tmp_path):
+    cfg = tmp_path / "config.yaml"
+    runner = Runner(None, cfg)
+    # 上一次启动时的有效配置：只用 Plex、开启 dry-run
+    runner.cfg = parse_config({"plex": {"url": "http://p", "token": "t"}, "emby": None, "mappings": [{"trakt_user": "me"}], "trakt": {"client_id": "c"}, "sync": {"dry_run": True}})
+    cfg.write_text("plex: {url: '', token: ''}\n", encoding="utf-8")
+    asyncio.run(runner.start())
+    status = runner.status()
+    assert runner.error and "配置无效" in runner.error
+    assert status["servers"] == ["plex", "emby"] and status["dry_run"] is False
