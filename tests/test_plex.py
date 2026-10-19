@@ -99,3 +99,17 @@ def test_list_section_gives_up_after_too_many_bad_items(monkeypatch):
     c = Library(20, bad={1, 2, 3})
     with pytest.raises(aiohttp.ClientResponseError):
         _keys(c)
+
+
+def test_ws_error_hides_token():
+    from aiohttp import ClientResponseError, RequestInfo
+    from multidict import CIMultiDict, CIMultiDictProxy
+    from yarl import URL
+
+    from mediaresume.plex import _ws_error
+
+    url = URL("ws://p/:/websockets/notifications?X-Plex-Token=secret")
+    info = RequestInfo(url, "GET", CIMultiDictProxy(CIMultiDict()), url)
+    e = ClientResponseError(info, (), status=401, message="Unauthorized")
+    assert "secret" in str(e)  # aiohttp 默认的异常文本包含完整 URL
+    assert _ws_error(e) == "HTTP 401 Unauthorized"

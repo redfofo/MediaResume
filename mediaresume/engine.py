@@ -258,13 +258,15 @@ class SyncEngine:
     async def _poll_loop(self) -> None:
         while True:
             await asyncio.sleep(self.cfg.sync.poll_interval)
-            try:
-                for pair in self.pairs:
+            # 逐个映射处理：一个映射出错（如该用户的 Plex Token 失效）不能让其他映射停止同步
+            errors = []
+            for pair in self.pairs:
+                try:
                     await self._poll(pair)
-                self.poll_error = None
-            except Exception as e:
-                self.poll_error = str(e) or e.__class__.__name__
-                log.warning("增量轮询失败: %s", self.poll_error)
+                except Exception as e:
+                    errors.append(f"[{pair.label}] {str(e) or e.__class__.__name__}")
+                    log.warning("[%s] 增量轮询失败: %s", pair.label, str(e) or e.__class__.__name__)
+            self.poll_error = "; ".join(errors) or None
             self.last_poll = time.time()
 
     async def _poll(self, pair: Pair) -> None:

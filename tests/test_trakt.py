@@ -223,9 +223,13 @@ def test_auth_failure_stops_account(tmp_path):
 def test_push_full(tmp_path):
     client = FakeClient(not_found={"shows": [{"ids": {"tmdb": 1399}}]})
     sync, acc = make(client, tmp_path)
+    seen = []
+    sync.on_history = lambda user, items: seen.append(items)
     plan = PushPlan(history={MOVIE: 1_700_000_000, EP1: 0}, progress={EP2: 30.0}, clear={MOVIE: 7})
     run(sync.push_full("me", plan))
     assert client.posts == [history_payload(plan.history)]
+    # 写入的观看记为已见，Trakt 不认识的（EP1 所属的剧）不记
+    assert seen == [{MOVIE: 1_700_000_000}]
     assert client.scrobbles == [("stop", EP2, 30.0)]
     assert client.removed == [7]
     assert acc.progress_sent[EP2] == (30.0, False)
@@ -1050,3 +1054,93 @@ def test_config_single_server():
     assert cfg.mappings[0].plex_user is None  # 不会要求填写 Plex 用户 Token
     with pytest.raises(ValueError, match="至少需要配置"):
         parse_config({"mappings": [{"trakt_user": "me"}], "trakt": {"client_id": "a"}})
+
+
+def test_push_full_without_time_seen_as_now(tmp_path):
+    client = FakeClient()
+    sync, _ = make(client, tmp_path)
+    seen = []
+    sync.on_history = lambda user, items: seen.append(items)
+    run(sync.push_full("me", PushPlan(history={MOVIE: 0})))
+    assert len(seen) == 1 and seen[0][MOVIE] >= NOW
+
+
+def test_device_token_slow_down_is_not_retried(tmp_path, monkeypatch):
+    """设备码轮询的 429 表示 slow_down，要原样返回给页面，不能在服务端等待重试"""
+    import aiohttp
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    from mediaresume import trakt
+
+    calls = []
+
+    async def device_token(request):
+        calls.append(1)
+        return web.json_response({}, status=429, headers={"Retry-After": "30"})
+
+    async def main():
+        app = web.Application()
+        app.router.add_post("/oauth/device/token", device_token)
+        async with TestServer(app) as server:
+            monkeypatch.setattr(trakt, "API", str(server.make_url("")).rstrip("/"))
+            async with aiohttp.ClientSession() as http:
+                client = TraktClient(http, TraktConfig("cid"), TraktTokenStore(tmp_path / "t.json"))
+                return await asyncio.wait_for(client.device_token("code"), 5)
+
+    assert run(main())[0] == 429 and calls == [1]
+
+
+def test_full_reads_cached_until_write(tmp_path, monkeypatch):
+    """预览后接着执行只拉取一次全量数据；有写入后重新拉取"""
+    import aiohttp
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer
+
+    from mediaresume import trakt
+
+    hits = {"watched": 0, "playback": 0}
+
+    async def watched(request):
+        hits["watched"] += request.query["page"] == "1"  # 每次全量读取会并发请求多页
+        return web.json_response([{"movie": {"ids": {"tmdb": 603}}}])
+
+    async def empty(request):
+        return web.json_response([])
+
+    async def playback(request):
+        hits["playback"] += request.query["page"] == "1"  # 每次全量读取会并发请求多页
+        return web.json_response([])
+
+    async def add_history(request):
+        return web.json_response({"added": {"movies": 1}})
+
+    async def main():
+        app = web.Application()
+        app.router.add_get("/sync/watched/movies", watched)
+        app.router.add_get("/sync/history/episodes", empty)
+        app.router.add_get("/sync/playback", playback)
+        app.router.add_post("/sync/history", add_history)
+        async with TestServer(app) as server:
+            monkeypatch.setattr(trakt, "API", str(server.make_url("")).rstrip("/"))
+            monkeypatch.setattr(trakt, "WRITE_INTERVAL", 0)
+            store = TraktTokenStore(tmp_path / "tokens.json")
+            store.set("me", {"access_token": "a", "refresh_token": "r", "expires_at": int(time.time()) + 86400, "client_id": "cid"})
+            async with aiohttp.ClientSession() as http:
+                client = TraktClient(http, TraktConfig("cid"), store)
+                first = await client.watched("me")
+                first.clear()  # 调用方修改返回值不影响缓存
+                assert await client.watched("me") == {MOVIE: 0}
+                await client.playback("me")
+                await client.playback("me")
+                assert hits == {"watched": 1, "playback": 1}
+                await client.add_history("me", history_payload({MOVIE: NOW}))
+                await client.watched("me")
+                await client.playback("me")
+                assert hits == {"watched": 2, "playback": 2}
+                # 缓存过期后重新拉取
+                monkeypatch.setattr(trakt, "READ_CACHE_TTL", 0)
+                await client.watched("me")
+                assert hits["watched"] == 3
+
+    run(main())

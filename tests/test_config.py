@@ -28,7 +28,10 @@ def test_defaults_are_valid():
         ({"sync": {"poll_interval": True}}, "sync.poll_interval 必须是整数"),
         ({"sync": {"dry_run": "yes"}}, "sync.dry_run 必须是 true 或 false"),
         ({"log_level": "LOUD"}, "log_level 必须是"),
-        ({"trakt": {"push_interval": -1}}, "不能小于 0"),
+        ({"trakt": {"push_interval": -1}}, "定时全量同步到 Trakt 的间隔（小时） 不能小于 0"),
+        ({"trakt": {"pull_interval": "x"}}, "定时从 Trakt 全量同步的间隔（小时） 必须是整数"),
+        ({"trakt": "on"}, "配置项 trakt 必须是一个对象"),
+        ({"mappings": ["u"]}, "mappings 必须是用户映射的列表"),
     ],
 )
 def test_rejects_invalid_values(extra, message):
@@ -215,3 +218,24 @@ def test_single_server_config_roundtrip(tmp_path):
     # 页面据 null 显示该服务器未启用
     assert config_form({"plex": None, "emby": {"url": "http://e"}})["plex"] is None
     assert config_form({"emby": {"url": "http://e"}})["plex"] == {"url": "", "token": ""}
+
+
+def test_non_object_config_rejected():
+    with pytest.raises(ValueError, match="配置必须是一个对象"):
+        parse_config(["x"])
+
+
+def test_warns_when_relative_db_outside_config_dir(tmp_path, monkeypatch, caplog):
+    from mediaresume.web import _warn_db_location
+
+    conf = tmp_path / "conf"
+    conf.mkdir()
+    monkeypatch.chdir(tmp_path)
+    with caplog.at_level("WARNING", logger="web"):
+        _warn_db_location("data/state.db", conf / "config.yaml")
+        assert str(tmp_path / "data" / "state.db") in caplog.text
+        caplog.clear()
+        _warn_db_location(str(tmp_path / "state.db"), conf / "config.yaml")  # 绝对路径
+        monkeypatch.chdir(conf)
+        _warn_db_location("data/state.db", conf / "config.yaml")  # 与配置同目录（Docker 默认）
+        assert caplog.text == ""

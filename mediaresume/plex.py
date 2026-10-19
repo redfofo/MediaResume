@@ -401,8 +401,15 @@ class PlexClient:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.warning("Plex WebSocket 断开: %s", e)
+                log.warning("Plex WebSocket 断开: %s", _ws_error(e))
             finally:
                 self.connected = False
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
+
+
+def _ws_error(e: Exception) -> str:
+    """握手失败的异常文本含完整 URL（带 X-Plex-Token 参数），只保留状态码和原因"""
+    if isinstance(e, aiohttp.ClientResponseError):
+        return f"HTTP {e.status} {e.message}".rstrip()
+    return str(e) or e.__class__.__name__

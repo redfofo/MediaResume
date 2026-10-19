@@ -95,6 +95,7 @@ class Runner:
         try:
             logging.getLogger().setLevel(self.cfg.log_level)
             self.store = StateStore(self.cfg.db_path)
+            _warn_db_location(self.cfg.db_path, self.config_path)
             trakt = None
             if any(m.trakt_user for m in self.cfg.mappings):
                 client = TraktClient(self.http, self.cfg.trakt, self.trakt_tokens)
@@ -447,6 +448,19 @@ def _pair_info(p: Pair) -> dict:
     # plex_user 为空表示服务器所有者，emby_user 为空表示未配置 Emby；是否有 Plex 看 servers
     servers = [s for s, present in (("plex", p.plex_token), ("emby", p.emby_user_id)) if present]
     return {"id": p.id, "servers": servers, "plex_user": p.mapping.plex_user, "emby_user": p.emby_user_name or p.mapping.emby_user}
+
+
+def _warn_db_location(db_path: str, config_path: Path) -> None:
+    """相对的 db_path 按当前目录解析（为兼容已有部署不改），而 Trakt 授权等文件放在配置文件所在目录。
+    两者不同时提示数据库的实际位置，避免迁移时只拷走配置目录、丢失同步基准"""
+    db = Path(db_path)
+    if db.is_absolute() or Path.cwd().resolve() == config_path.parent.resolve():
+        return
+    log.warning(
+        "db_path 是相对路径，按当前目录解析：数据库位于 %s，不在配置文件所在目录 %s 下。"
+        "迁移或备份时请一并保留，或在配置中把 db_path 改为绝对路径",
+        db.resolve(), config_path.parent.resolve(),
+    )
 
 
 def _describe(exc: BaseException) -> str:

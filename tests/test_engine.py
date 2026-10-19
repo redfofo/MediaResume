@@ -295,3 +295,26 @@ def test_single_server_pair_id_and_label():
     assert Pair(Mapping(None, ""), "t", "").id == "plex:@owner"
     emby = Pair(Mapping(None, "dlwlrma"), "", guid, "dlwlrma")
     assert (emby.id, emby.label) == (f"emby:{guid}", "Emby:dlwlrma")
+
+
+def test_poll_failure_does_not_block_other_pairs():
+    eng, _ = make_engine(mappings=[Mapping("a", "u", plex_token="ta"), Mapping("b", "v", plex_token="tb")])
+    eng.cfg.sync.poll_interval = 0
+    polled = []
+
+    async def poll(pair):
+        polled.append(pair.mapping.plex_user)
+        if pair.mapping.plex_user == "a":
+            raise RuntimeError("401")
+
+    eng._poll = poll
+
+    async def main():
+        task = asyncio.create_task(eng._poll_loop())
+        while eng.last_poll is None:
+            await asyncio.sleep(0)
+        task.cancel()
+
+    run(main())
+    assert polled[:2] == ["a", "b"]
+    assert "401" in eng.poll_error and "a⇄" in eng.poll_error

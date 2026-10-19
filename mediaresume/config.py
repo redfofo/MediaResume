@@ -111,6 +111,14 @@ def _as_bool(value: Any, name: str) -> bool:
 
 def parse_config(raw: dict[str, Any]) -> Config:
     """从 dict 构造并校验配置，校验失败抛出 ValueError"""
+    if not isinstance(raw, dict):
+        raise ValueError("配置必须是一个对象")
+    for section in ("plex", "emby", "trakt", "sync"):
+        if raw.get(section) is not None and not isinstance(raw[section], dict):
+            raise ValueError(f"配置项 {section} 必须是一个对象")
+    raw_mappings = raw.get("mappings") or []
+    if not isinstance(raw_mappings, list) or not all(isinstance(m, dict) for m in raw_mappings):
+        raise ValueError("mappings 必须是用户映射的列表")
     plex: Optional[PlexConfig] = None
     emby: Optional[EmbyConfig] = None
     # 整段缺失或为 null 表示不使用该服务器
@@ -135,7 +143,7 @@ def parse_config(raw: dict[str, Any]) -> Config:
             plex_token=(str(m.get("plex_token") or "").strip() or None) if plex else None,
             trakt_user=str(m.get("trakt_user") or "").strip() or None,
         )
-        for m in raw.get("mappings") or []
+        for m in raw_mappings
     ]
     if not mappings:
         raise ValueError("至少需要一个用户映射")
@@ -159,8 +167,8 @@ def parse_config(raw: dict[str, Any]) -> Config:
         **{k: v for k, v in trakt_raw.items() if k in TraktConfig.__dataclass_fields__ and v is not None},
     )
     trakt.client_id, trakt.client_secret = str(trakt.client_id).strip(), str(trakt.client_secret).strip()
-    trakt.push_interval = _as_int(trakt.push_interval, "Trakt 定时全量同步间隔（小时）", 0)
-    trakt.pull_interval = _as_int(trakt.pull_interval, "Trakt 定时全量同步间隔（小时）", 0)
+    trakt.push_interval = _as_int(trakt.push_interval, "定时全量同步到 Trakt 的间隔（小时）", 0)
+    trakt.pull_interval = _as_int(trakt.pull_interval, "定时从 Trakt 全量同步的间隔（小时）", 0)
     trakt.scrobble = _as_bool(trakt.scrobble, "trakt.scrobble")
     trakt.sync_marks = _as_bool(trakt.sync_marks, "trakt.sync_marks")
     trakt.sync_unwatch = _as_bool(trakt.sync_unwatch, "trakt.sync_unwatch")

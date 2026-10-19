@@ -38,6 +38,9 @@ PROGRESS_MIN, PROGRESS_MAX = 1.0, 80.0
 PROGRESS_STEP = 1.0
 # 列表接口的分页大小（Trakt 上限 250）与并发拉取的页数
 PAGE_LIMIT, PAGE_CONCURRENCY = 250, 8
+# 全量观看记录 / 播放进度的缓存时间（秒）：全量同步的预览和执行、共用一个账户的多个映射会接连读取同样的数据。
+# 对该账户的任何写入都会立即作废缓存
+READ_CACHE_TTL = 60
 # 标记已看 / 清除进度延迟这么久（秒）再推送，期间改回（误点、开始重看）则取消
 MARK_DELAY = 60
 # scrobble 记录的观看时间由 Trakt 服务器决定，记为已见时多留这么多秒，容忍时钟偏差
@@ -109,6 +112,10 @@ class TraktClient:
         # 并发请求只刷新一次 token：旧 refresh_token 刷新后即失效
         self._refresh_lock = asyncio.Lock()
         self._last_write = 0.0
+        # (用户名, 数据名) -> (读取时间, 数据)
+        self._cache: dict[tuple[str, str], tuple[float, Any]] = {}
+        # 每个用户的写入计数：读取期间有写入时，读到的可能是旧数据，不放入缓存
+        self._writes: dict[str, int] = {}
 
     def _headers(self, access_token: Optional[str] = None) -> dict:
         headers = {
@@ -121,10 +128,13 @@ class TraktClient:
             headers["Authorization"] = f"Bearer {access_token}"
         return headers
 
-    async def _raw(self, method: str, path: str, body: Any = None, access_token: Optional[str] = None) -> tuple[int, Any]:
+    async def _raw(
+        self, method: str, path: str, body: Any = None, access_token: Optional[str] = None, retry_429: bool = True
+    ) -> tuple[int, Any]:
+        """retry_429=False 时 429 原样返回（设备码轮询用 429 表示 slow_down，应由页面放慢轮询）"""
         for _ in range(3):
             async with self.http.request(method, API + path, json=body, headers=self._headers(access_token)) as resp:
-                if resp.status == 429:
+                if resp.status == 429 and retry_429:
                     wait = float(resp.headers.get("Retry-After") or 10)
                     log.debug("Trakt 限流，%ss 后重试 %s", wait, path)
                     await asyncio.sleep(wait)
@@ -147,7 +157,7 @@ class TraktClient:
     async def device_token(self, device_code: str) -> tuple[int, Optional[dict]]:
         """返回 (HTTP 状态码, token 响应)；400 表示用户尚未完成授权"""
         body = self._with_secret({"code": device_code, "client_id": self.cfg.client_id})
-        return await self._raw("POST", "/oauth/device/token", body)
+        return await self._raw("POST", "/oauth/device/token", body, retry_429=False)
 
     def _with_secret(self, body: dict) -> dict:
         """Trakt 新建的 App 不再发放 Client Secret（已弃用、可选），旧 App 填了才发送"""
@@ -200,6 +210,7 @@ class TraktClient:
                     return await self._user_request_once(username, method, path, body, ok)
                 finally:
                     self._last_write = time.monotonic()
+                    self._invalidate(username)
         return await self._user_request_once(username, method, path, body, ok)
 
     async def _user_request_once(self, username: str, method: str, path: str, body: Any, ok: tuple[int, ...]) -> Any:
@@ -232,11 +243,30 @@ class TraktClient:
                     return out
             page += PAGE_CONCURRENCY
 
+    def _invalidate(self, username: str) -> None:
+        self._writes[username] = self._writes.get(username, 0) + 1
+        for k in [k for k in self._cache if k[0] == username]:
+            del self._cache[k]
+
+    async def _cached(self, username: str, name: str, fetch: Callable[[], Any]) -> dict:
+        """返回副本，调用方修改不影响缓存"""
+        hit = self._cache.get((username, name))
+        if hit and time.monotonic() - hit[0] < READ_CACHE_TTL:
+            return dict(hit[1])
+        writes = self._writes.get(username, 0)
+        value = await fetch()
+        if self._writes.get(username, 0) == writes:
+            self._cache[(username, name)] = (time.monotonic(), value)
+        return dict(value)
+
     async def watched(self, username: str) -> dict[MediaKey, int]:
-        movies = await self._user_pages(username, "/sync/watched/movies")
-        # /sync/watched/shows 已不再返回各季各集，剧集的已看从观看历史汇总
-        episodes = await self._user_pages(username, "/sync/history/episodes")
-        return parse_watched(movies, episodes)
+        async def fetch() -> dict[MediaKey, int]:
+            movies = await self._user_pages(username, "/sync/watched/movies")
+            # /sync/watched/shows 已不再返回各季各集，剧集的已看从观看历史汇总
+            episodes = await self._user_pages(username, "/sync/history/episodes")
+            return parse_watched(movies, episodes)
+
+        return await self._cached(username, "watched", fetch)
 
     async def add_history(self, username: str, payload: dict) -> dict:
         return await self._user_request(username, "POST", "/sync/history", payload) or {}
@@ -265,7 +295,10 @@ class TraktClient:
         return await self._user_request(username, "POST", "/sync/history/remove", {"ids": history_ids}) or {}
 
     async def playback(self, username: str) -> dict[MediaKey, "Playback"]:
-        return parse_playback(await self._user_pages(username, "/sync/playback"))
+        async def fetch() -> dict[MediaKey, Playback]:
+            return parse_playback(await self._user_pages(username, "/sync/playback"))
+
+        return await self._cached(username, "playback", fetch)
 
     async def remove_playback(self, username: str, playback_id: int) -> None:
         await self._user_request(username, "DELETE", f"/sync/playback/{playback_id}", ok=(404,))
@@ -794,6 +827,14 @@ class TraktSync:
             unknown_shows |= shows
             a = resp.get("added") or {}
             added += int(a.get("movies") or 0) + int(a.get("episodes") or 0)
+            # 与实时标记一样记为已见：之后在本地改为未看的，从 Trakt 全量同步时不会再被拉回已看。
+            # 没有观看时间的以 unknown 写入，Trakt 记录的时间不确定，按现在计
+            now = int(time.time())
+            self._history_added(acc, {
+                k: ts if ts > 0 else now + SEEN_MARGIN
+                for k, ts in batch.items()
+                if k.tmdb not in (movies if k.kind == "movie" else shows)
+            })
             log.info("Trakt[%s] 补观看记录 %d/%d", user, min(i + BATCH_SIZE, len(keys)), len(keys))
         if unknown_movies or unknown_shows:
             log.warning(
